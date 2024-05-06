@@ -1,0 +1,38 @@
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                   http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.1.xsd">
+
+    <changeSet id="add-foreign-key-page-site_id" author="ben4in">
+        <addForeignKeyConstraint baseColumnNames="site_id"
+                                 baseTableName="page"
+                                 constraintName="page_fk_site_id"
+                                 referencedColumnNames="id"
+                                 referencedTableName="site"/>
+    </changeSet>
+
+    <changeSet id="add-foreign-key-lemma-site_id" author="ben4in">
+        <addForeignKeyConstraint baseColumnNames="site_id"
+                                 baseTableName="lemma"
+                                 constraintName="lemma_fk"
+                                 referencedColumnNames="id"
+                                 referencedTableName="site"/>
+    </changeSet>
+
+    <changeSet id="add-foreign-key-index-page_id" author="ben4in">
+        <addForeignKeyConstraint baseColumnNames="page_id"
+                                 baseTableName="index"
+                                 constraintName="index_page_fk"
+                                 referencedColumnNames="id"
+                                 referencedTableName="page"/>
+    </changeSet>
+
+    <changeSet id="add-foreign-key-index-lemma_id" author="ben4in">
+        <addForeignKeyConstraint baseColumnNames="lemma_id"
+                                 baseTableName="index"
+                                 constraintName="lemma_fk_index"
+                                 referencedColumnNames="id"
+                                 referencedTableName="lemma"/>
+    </changeSet>
+
+</databaseChangeLog>
