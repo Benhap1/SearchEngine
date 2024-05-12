@@ -94,16 +94,16 @@ public class SiteIndexingService {
         log.info("Завершение индексации сайта indexSite: {}", site.getUrl());
     }
 
-//    @Transactional
-//    public void stopIndexing() {
-//        // Останавливаем индексацию для всех сайтов, находящихся в процессе индексации
-//        List<SiteEntity> sitesInProgress = siteRepository.findByStatus(SiteStatus.INDEXING.name());
-//        for (SiteEntity site : sitesInProgress) {
-//            site.setStatus(SiteStatus.FAILED.name());
-//            site.setLastError("Индексация остановлена пользователем");
-//            siteRepository.save(site);
-//        }
-//    }
+    @Transactional
+    public void stopIndexing() {
+        // Останавливаем индексацию для всех сайтов, находящихся в процессе индексации
+        List<SiteEntity> sitesInProgress = siteRepository.findByStatus(SiteStatus.INDEXING.name());
+        for (SiteEntity site : sitesInProgress) {
+            site.setStatus(SiteStatus.FAILED.name());
+            site.setLastError("Индексация остановлена пользователем");
+            siteRepository.save(site);
+        }
+    }
 
     private void indexPages(String baseUrl, SiteEntity indexedSite) {
         log.info("Начало индексации страниц сайта: {}", baseUrl);
