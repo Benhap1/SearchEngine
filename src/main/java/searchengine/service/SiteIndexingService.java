@@ -1,6 +1,5 @@
 package searchengine.service;
 
-import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
@@ -25,6 +24,7 @@ import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
+
 @Slf4j
 @Service
 public class SiteIndexingService {
@@ -35,9 +35,7 @@ public class SiteIndexingService {
     @Autowired
     private PageRepository pageRepository;
 
-
     private AtomicInteger remainingPages; // Атомарная переменная для отслеживания оставшихся страниц
-
 
     @Transactional
     public void indexSites(List<Site> sites) {
@@ -49,7 +47,6 @@ public class SiteIndexingService {
             sites.forEach(site -> executorService.submit(() -> indexSite(site)));
             executorService.shutdown();
             executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-
         } catch (InterruptedException e) {
             log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
@@ -73,21 +70,15 @@ public class SiteIndexingService {
         String currentStatus = indexedSite.getStatus();
         log.info("Статус сайта до обновления: {}", indexedSite.getStatus());
         if (currentStatus.equals(SiteStatus.INDEXED.name()) || currentStatus.equals(SiteStatus.FAILED.name()) || currentStatus.equals(SiteStatus.INDEXING.name())) {
-
-            // Если сайт уже проиндексирован или индексация завершилась с ошибкой, устанавливаем новое время начала индексации
             indexedSite.setStatus(SiteStatus.INDEXING.name());
             indexedSite.setStatusTime(LocalDateTime.now());
-
-            // Сохраняем обновленный статус и время в базе данных
             siteRepository.save(indexedSite);
-
             log.info("Статус сайта после обновления: {}", indexedSite.getStatus());
         }
-// Проверяем, есть ли уже записи страниц для данного сайта
         List<PageEntity> existingPages = pageRepository.findBySite(indexedSite);
         if (!existingPages.isEmpty()) {
             log.info("Удаление существующих записей страниц для сайта: {}", indexedSite.getUrl());
-            pageRepository.deleteAll(existingPages); // Удаляем существующие записи страниц
+            pageRepository.deleteAll(existingPages);
         }
         indexPages(site.getUrl(), indexedSite); // Производим индексацию страниц
         updateSiteStatus(indexedSite); // Обновляем статус на INDEXED после завершения индексации
@@ -96,7 +87,6 @@ public class SiteIndexingService {
 
     @Transactional
     public void stopIndexing() {
-        // Останавливаем индексацию для всех сайтов, находящихся в процессе индексации
         List<SiteEntity> sitesInProgress = siteRepository.findByStatus(SiteStatus.INDEXING.name());
         for (SiteEntity site : sitesInProgress) {
             site.setStatus(SiteStatus.FAILED.name());
@@ -125,15 +115,13 @@ public class SiteIndexingService {
         Optional<SiteEntity> existingSite = siteRepository.findByUrl(site.getUrl());
         SiteEntity indexedSite;
         if (existingSite.isPresent()) {
-            // Если сайт уже есть в базе, возвращаем существующую запись
             indexedSite = existingSite.get();
         } else {
-            // Если сайта нет в базе, создаем новую запись
             indexedSite = new SiteEntity();
             indexedSite.setUrl(site.getUrl());
             indexedSite.setName(site.getName());
-            indexedSite.setStatus(SiteStatus.INDEXING.name()); // Устанавливаем статус INDEXING
-            indexedSite.setStatusTime(LocalDateTime.now()); // Устанавливаем время начала индексации
+            indexedSite.setStatus(SiteStatus.INDEXING.name());
+            indexedSite.setStatusTime(LocalDateTime.now());
             try {
                 siteRepository.save(indexedSite);
                 log.info("Создана запись для сайта: {}", site.getUrl());
@@ -159,8 +147,6 @@ public class SiteIndexingService {
 
         extractLinksAndIndexPages(document, siteEntity, visitedUrls);
 
-
-        // После обработки всех страниц уменьшаем счетчик и логируем завершение, если все страницы обработаны
         int remaining = remainingPages.decrementAndGet();
         if (remaining == 0) {
             log.info("Все страницы сайта обработаны. Завершение индексации.");
@@ -185,7 +171,6 @@ public class SiteIndexingService {
             return null;
         }
 
-        // Проверка наличия дубликатов
         Optional<PageEntity> existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
         if (existingPage.isPresent()) {
             log.info("Запись для страницы уже существует: {}", url);
@@ -214,21 +199,19 @@ public class SiteIndexingService {
         return null;
     }
 
-
     private void extractLinksAndIndexPages(Document document, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         log.info("Начало извлечения ссылок и индексации страниц: {}", document.baseUri());
         Elements links = document.select("a[href]");
-        int newUrlsCount = 0; // Счетчик новых URL-адресов
         for (Element link : links) {
             String nextUrl = link.absUrl("href");
             if (visitedUrls.putIfAbsent(nextUrl, true) == null && isInternalLink(nextUrl, siteEntity.getUrl())) {
-                ForkJoinPool.commonPool().invoke(new IndexPageTask(nextUrl, siteEntity, visitedUrls));
-                newUrlsCount++; // Увеличение счетчика новых URL-адресов
+                try {
+                    Document nextDocument = Jsoup.connect(nextUrl).get();
+                    visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
+                } catch (IOException e) {
+                    log.error("Ошибка при получении страницы {}: {}", nextUrl, e.getMessage());
+                }
             }
-        }
-        if (newUrlsCount == 0) {
-            log.info("Больше нет новых ссылок для индексации. Прекращение индексации.");
-            return; // Прекращение индексации, если нет новых ссылок
         }
         log.info("Завершение извлечения ссылок и индексации страниц: {}", document.baseUri());
     }
@@ -238,74 +221,38 @@ public class SiteIndexingService {
             URL nextUrl = new URL(url);
             URL base = new URL(baseUrl);
 
-            // Получаем хосты (домены) без протокола (http:// или https://)
             String nextHost = nextUrl.getHost().replaceAll("^(http://|https://|www\\.)", "");
             String baseHost = base.getHost().replaceAll("^(http://|https://|www\\.)", "");
 
-
-            // Проверяем, содержит ли ссылка имя домена базового URL сайта
             return nextHost.contains(baseHost);
         } catch (MalformedURLException e) {
-            // Обработка ошибки, если URL некорректный
             log.error("Ошибка при разборе URL: {}", e.getMessage());
             return false;
         }
     }
 
-
-
     private void updateSiteStatus(SiteEntity siteEntity) {
         log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
-        siteEntity.setStatus(SiteStatus.INDEXED.name()); // Устанавливаем новый статус INDEXED
+        siteEntity.setStatus(SiteStatus.INDEXED.name());
         siteEntity.setStatusTime(LocalDateTime.now());
         try {
             siteRepository.save(siteEntity);
             log.info("Завершение обновления статуса сайта: {}", siteEntity.getUrl());
         } catch (Exception e) {
             log.error("Ошибка при обновлении статуса сайта {}: {}", siteEntity.getUrl(), e.getMessage());
-
         }
     }
 
-
     private void handleIndexingError(SiteEntity indexedSite, IOException e) {
         String errorMessage = "Ошибка при индексации сайта " + indexedSite.getUrl() + ": " + e.getMessage();
-        log.error(errorMessage, e); // Логирование ошибки с деталями исключения
+        log.error(errorMessage, e);
         indexedSite.setStatus(SiteStatus.FAILED.name());
         indexedSite.setLastError("Ошибка при попытке получения содержимого сайта: " + e.getMessage());
         try {
             siteRepository.save(indexedSite);
         } catch (Exception ex) {
             String saveError = "Ошибка при сохранении статуса ошибки индексации сайта " + indexedSite.getUrl() + ": " + ex.getMessage();
-            log.error(saveError, ex); // Логирование ошибки сохранения с деталями исключения
-        }
-    }
-
-
-    private class IndexPageTask extends RecursiveAction {
-
-        private final String url;
-        private final SiteEntity siteEntity;
-        private final ConcurrentHashMap<String, Boolean> visitedUrls;
-
-        public IndexPageTask(String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
-            this.url = url;
-            this.siteEntity = siteEntity;
-            this.visitedUrls = visitedUrls;
-        }
-
-        @Override
-        protected void compute() {
-            log.info("Начало обработки страницы в фоновом потоке: {}", url);
-            try {
-                Document document = Jsoup.connect(url).get();
-                String baseUri = document.baseUri();
-                visitPage(document, baseUri, siteEntity, visitedUrls);
-            } catch (IOException e) {
-                log.error("Ошибка при получении страницы {}: {}", url, e.getMessage());
-            } finally {
-                log.info("Завершение обработки страницы в фоновом потоке: {}", url);
-            }
+            log.error(saveError, ex);
         }
     }
 }
