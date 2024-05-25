@@ -14,7 +14,6 @@ import searchengine.model.SiteEntity;
 import searchengine.model.SiteStatus;
 import searchengine.repository.PageRepository;
 import searchengine.repository.SiteRepository;
-
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -39,29 +38,32 @@ public class SiteIndexingService {
 
     @Transactional
     public void indexSites(List<Site> sites) {
-        log.info("Начало индексации сайта метода indexSites: {}", sites);
-        ExecutorService executorService = Executors.newFixedThreadPool(sites.size());
+        log.info("Начало индексации сайтов: {}", sites);
         remainingPages = new AtomicInteger(sites.size()); // Инициализируем счетчик
 
+        List<CompletableFuture<Void>> indexingTasks = sites.stream()
+                .map(this::indexSiteAsync)
+                .toList();
+
+        CompletableFuture<Void> allTasks = CompletableFuture.allOf(indexingTasks.toArray(new CompletableFuture[0]));
+
         try {
-            sites.forEach(site -> executorService.submit(() -> indexSite(site)));
-            executorService.shutdown();
-            executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-        } catch (InterruptedException e) {
+            allTasks.get(); // Ждем завершения всех задач
+        } catch (InterruptedException | ExecutionException e) {
             log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
-        } finally {
-            if (!executorService.isTerminated()) {
-                executorService.shutdownNow();
-            }
         }
 
-        log.info("Конец индексации сайта метода indexSites: {}", sites);
+        log.info("Конец индексации сайтов: {}", sites);
+    }
+
+    public CompletableFuture<Void> indexSiteAsync(Site site) {
+        return CompletableFuture.runAsync(() -> indexSite(site));
     }
 
     @Transactional
     public void indexSite(Site site) {
-        log.info("Начало индексации сайта indexSite: {}", site.getUrl());
+        log.info("Начало индексации сайта: {}", site.getUrl());
         SiteEntity indexedSite = prepareSiteEntity(site); // Получаем или создаем запись о сайте
         if (indexedSite == null) {
             log.error("Не удалось создать запись для сайта: {}", site.getUrl());
@@ -82,7 +84,7 @@ public class SiteIndexingService {
         }
         indexPages(site.getUrl(), indexedSite); // Производим индексацию страниц
         updateSiteStatus(indexedSite); // Обновляем статус на INDEXED после завершения индексации
-        log.info("Завершение индексации сайта indexSite: {}", site.getUrl());
+        log.info("Завершение индексации сайта: {}", site.getUrl());
     }
 
     @Transactional
@@ -205,12 +207,14 @@ public class SiteIndexingService {
         for (Element link : links) {
             String nextUrl = link.absUrl("href");
             if (visitedUrls.putIfAbsent(nextUrl, true) == null && isInternalLink(nextUrl, siteEntity.getUrl())) {
-                try {
-                    Document nextDocument = Jsoup.connect(nextUrl).get();
-                    visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
-                } catch (IOException e) {
-                    log.error("Ошибка при получении страницы {}: {}", nextUrl, e.getMessage());
-                }
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        Document nextDocument = Jsoup.connect(nextUrl).get();
+                        visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
+                    } catch (IOException e) {
+                        log.error("Ошибка при получении страницы {}: {}", nextUrl, e.getMessage());
+                    }
+                });
             }
         }
         log.info("Завершение извлечения ссылок и индексации страниц: {}", document.baseUri());
