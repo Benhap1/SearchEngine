@@ -6,12 +6,13 @@ import searchengine.model.PageEntity;
 import searchengine.model.SiteEntity;
 
 import java.util.List;
+import java.util.Optional;
 
 @Repository
 public interface PageRepository extends JpaRepository<PageEntity, Long> {
 
-    void deleteBySite(SiteEntity siteEntity);
-    long countBySite(SiteEntity siteEntity);
     List<PageEntity> findBySite(SiteEntity site);
+
+    Optional<PageEntity> findBySiteAndPath(SiteEntity siteEntity, String path);
 }
 

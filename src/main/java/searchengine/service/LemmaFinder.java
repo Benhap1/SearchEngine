@@ -9,7 +9,7 @@ import java.io.IOException;
 import java.util.*;
 
 @Slf4j
-@Service
+//@Service
 public class LemmaFinder {
     private final LuceneMorphology luceneMorphology;
     private static final String WORD_TYPE_REGEX = "\\W\\w&&[^а-яА-Я\\s]";

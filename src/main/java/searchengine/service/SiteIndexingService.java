@@ -171,30 +171,34 @@ public class SiteIndexingService {
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
         log.info("Начало создания записи страницы: {}", url);
-        PageEntity pageEntity = new PageEntity();
-        pageEntity.setSite(siteEntity);
-
-        // Извлекаем путь страницы из URL без домена
-        String path = null;
+        String path;
         try {
             URL parsedUrl = new URL(url);
             path = parsedUrl.getPath();
         } catch (MalformedURLException e) {
             log.error("Ошибка при разборе URL: {}", e.getMessage());
+            return null;
         }
 
-        if (path != null && !path.isEmpty()) {
-            pageEntity.setPath(path);
-        } else {
+        if (path == null || path.isEmpty()) {
             log.error("Не удалось извлечь путь страницы из URL: {}", url);
             return null;
         }
 
+        // Проверка наличия дубликатов
+        Optional<PageEntity> existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
+        if (existingPage.isPresent()) {
+            log.info("Запись для страницы уже существует: {}", url);
+            return existingPage.get();
+        }
+
+        PageEntity pageEntity = new PageEntity();
+        pageEntity.setSite(siteEntity);
+        pageEntity.setPath(path);
+
         try {
             int statusCode = Jsoup.connect(url).execute().statusCode();
             pageEntity.setCode(statusCode);
-
-            // Сохранение страницы в базу данных
             pageEntity.setContent(document.outerHtml());
             pageRepository.save(pageEntity);
             log.info("Запись страницы успешно сохранена: {}", url);
@@ -209,6 +213,7 @@ public class SiteIndexingService {
 
         return null;
     }
+
 
     private void extractLinksAndIndexPages(Document document, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         log.info("Начало извлечения ссылок и индексации страниц: {}", document.baseUri());
