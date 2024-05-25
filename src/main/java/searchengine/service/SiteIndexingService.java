@@ -34,6 +34,13 @@ public class SiteIndexingService {
     @Autowired
     private PageRepository pageRepository;
 
+    // Кэш для хранения результатов запросов по URL сайтов
+    private final ConcurrentHashMap<String, SiteEntity> siteCache = new ConcurrentHashMap<>();
+
+    // Кэш проверки существования URL страниц
+    private final ConcurrentHashMap<String, Boolean> pageUrlCache = new ConcurrentHashMap<>();
+
+
     private AtomicInteger remainingPages; // Атомарная переменная для отслеживания оставшихся страниц
 
     @Transactional
@@ -114,32 +121,38 @@ public class SiteIndexingService {
 
     private SiteEntity prepareSiteEntity(Site site) {
         log.info("Начало подготовки данных сайта: {}", site.getUrl());
-        Optional<SiteEntity> existingSite = siteRepository.findByUrl(site.getUrl());
-        SiteEntity indexedSite;
-        if (existingSite.isPresent()) {
-            indexedSite = existingSite.get();
-        } else {
-            indexedSite = new SiteEntity();
-            indexedSite.setUrl(site.getUrl());
-            indexedSite.setName(site.getName());
-            indexedSite.setStatus(SiteStatus.INDEXING.name());
-            indexedSite.setStatusTime(LocalDateTime.now());
-            try {
-                siteRepository.save(indexedSite);
-                log.info("Создана запись для сайта: {}", site.getUrl());
-            } catch (Exception e) {
-                log.error("Ошибка при создании записи для сайта {}: {}", site.getUrl(), e.getMessage());
-                return null;
-            } finally {
-                log.info("Завершение подготовки данных сайта: {}", site.getUrl());
+        SiteEntity indexedSite = siteCache.computeIfAbsent(site.getUrl(), url -> {
+            Optional<SiteEntity> existingSite = siteRepository.findByUrl(url);
+            if (existingSite.isPresent()) {
+                return existingSite.get();
+            } else {
+                SiteEntity newSite = new SiteEntity();
+                newSite.setUrl(site.getUrl());
+                newSite.setName(site.getName());
+                newSite.setStatus(SiteStatus.INDEXING.name());
+                newSite.setStatusTime(LocalDateTime.now());
+                try {
+                    siteRepository.save(newSite);
+                    log.info("Создана запись для сайта: {}", site.getUrl());
+                    return newSite;
+                } catch (Exception e) {
+                    log.error("Ошибка при создании записи для сайта {}: {}", site.getUrl(), e.getMessage());
+                    return null;
+                }
             }
-        }
+        });
+        log.info("Завершение подготовки данных сайта: {}", site.getUrl());
         return indexedSite;
     }
 
     private void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         log.info("Начало обработки страницы: {}", url);
-        visitedUrls.putIfAbsent(url, true); // Добавляем URL-адрес, если его еще нет в мапе
+        visitedUrls.putIfAbsent(url, true);
+
+        if (pageUrlCache.putIfAbsent(url, true) != null) {
+            log.info("Страница уже была обработана: {}", url);
+            return;
+        }
 
         PageEntity pageEntity = createPageEntity(document, url, siteEntity);
         if (pageEntity == null) {
