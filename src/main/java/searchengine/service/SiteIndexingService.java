@@ -34,12 +34,8 @@ public class SiteIndexingService {
     @Autowired
     private PageRepository pageRepository;
 
-    // Кэш для хранения результатов запросов по URL сайтов
-    private final ConcurrentHashMap<String, SiteEntity> siteCache = new ConcurrentHashMap<>();
-
     // Кэш проверки существования URL страниц
     private final ConcurrentHashMap<String, Boolean> pageUrlCache = new ConcurrentHashMap<>();
-
 
     private AtomicInteger remainingPages; // Атомарная переменная для отслеживания оставшихся страниц
 
@@ -48,15 +44,18 @@ public class SiteIndexingService {
         log.info("Начало индексации сайтов: {}", sites);
         remainingPages = new AtomicInteger(sites.size()); // Инициализируем счетчик
 
-        List<CompletableFuture<Void>> indexingTasks = sites.stream()
-                .map(this::indexSiteAsync)
-                .toList();
+        ForkJoinPool forkJoinPool = new ForkJoinPool(); // Создаем ForkJoinPool
 
-        CompletableFuture<Void> allTasks = CompletableFuture.allOf(indexingTasks.toArray(new CompletableFuture[0]));
+        forkJoinPool.submit(() -> sites.parallelStream().forEach(this::indexSite)); // Используем ForkJoinPool для выполнения задач
 
         try {
-            allTasks.get(); // Ждем завершения всех задач
-        } catch (InterruptedException | ExecutionException e) {
+            forkJoinPool.shutdown();
+            forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+
+            // Очистка кэша после завершения всех задач
+            clearCache();
+
+        } catch (InterruptedException e) {
             log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
         }
@@ -64,35 +63,63 @@ public class SiteIndexingService {
         log.info("Конец индексации сайтов: {}", sites);
     }
 
-    public CompletableFuture<Void> indexSiteAsync(Site site) {
-        return CompletableFuture.runAsync(() -> indexSite(site));
+    private void clearCache() {
+        pageUrlCache.clear();
+        log.info("Кэш страниц очищен.");
     }
 
-    @Transactional
-    public void indexSite(Site site) {
+    private void indexSite(Site site) {
         log.info("Начало индексации сайта: {}", site.getUrl());
-        SiteEntity indexedSite = prepareSiteEntity(site); // Получаем или создаем запись о сайте
-        if (indexedSite == null) {
-            log.error("Не удалось создать запись для сайта: {}", site.getUrl());
-            return;
-        }
-        String currentStatus = indexedSite.getStatus();
-        log.info("Статус сайта до обновления: {}", indexedSite.getStatus());
-        if (currentStatus.equals(SiteStatus.INDEXED.name()) || currentStatus.equals(SiteStatus.FAILED.name()) || currentStatus.equals(SiteStatus.INDEXING.name())) {
-            indexedSite.setStatus(SiteStatus.INDEXING.name());
-            indexedSite.setStatusTime(LocalDateTime.now());
-            siteRepository.save(indexedSite);
-            log.info("Статус сайта после обновления: {}", indexedSite.getStatus());
-        }
-        List<PageEntity> existingPages = pageRepository.findBySite(indexedSite);
-        if (!existingPages.isEmpty()) {
-            log.info("Удаление существующих записей страниц для сайта: {}", indexedSite.getUrl());
-            pageRepository.deleteAll(existingPages);
-        }
-        indexPages(site.getUrl(), indexedSite); // Производим индексацию страниц
-        updateSiteStatus(indexedSite); // Обновляем статус на INDEXED после завершения индексации
+
+        // Устанавливаем статус индексации для сайта
+        updateSiteIndexingStatus(site);
+
+        // Получаем или создаем запись о сайте
+        SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
+                .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
+
+        // Производим индексацию страниц
+        indexPages(site.getUrl(), indexedSite);
+
+        // Обновляем статус на INDEXED после завершения индексации
+        updateSiteStatus(indexedSite);
+
         log.info("Завершение индексации сайта: {}", site.getUrl());
     }
+
+    private void updateSiteIndexingStatus(Site site) {
+        log.info("Установка статуса индексации для сайта: {}", site.getUrl());
+
+        // Удаляем существующие записи страниц для сайта
+        Optional<SiteEntity> existingSite = siteRepository.findByUrl(site.getUrl());
+        existingSite.ifPresent(siteEntity -> {
+            List<PageEntity> existingPages = pageRepository.findBySite(siteEntity);
+            if (!existingPages.isEmpty()) {
+                log.info("Удаление существующих записей страниц для сайта: {}", site.getUrl());
+                pageRepository.deleteAll(existingPages);
+            }
+        });
+
+        // Удаляем существующую запись о сайте, если она есть
+        existingSite.ifPresent(siteRepository::delete);
+
+        // Создаем новую запись о сайте с указанным статусом и временем
+        SiteEntity indexedSite = new SiteEntity();
+        indexedSite.setUrl(site.getUrl());
+        indexedSite.setName(site.getName());
+        indexedSite.setStatus(SiteStatus.INDEXING.name());
+        indexedSite.setStatusTime(LocalDateTime.now());
+        try {
+            siteRepository.save(indexedSite);
+            log.info("Создана запись для сайта: {}", site.getUrl());
+        } catch (Exception e) {
+            log.error("Ошибка при создании записи для сайта {}: {}", site.getUrl(), e.getMessage());
+            return;
+        }
+
+        log.info("Статус индексации для сайта установлен: {}", site.getUrl());
+    }
+
 
     @Transactional
     public void stopIndexing() {
@@ -117,32 +144,6 @@ public class SiteIndexingService {
         } finally {
             log.info("Конец индексации страниц сайта: {}", baseUrl);
         }
-    }
-
-    private SiteEntity prepareSiteEntity(Site site) {
-        log.info("Начало подготовки данных сайта: {}", site.getUrl());
-        SiteEntity indexedSite = siteCache.computeIfAbsent(site.getUrl(), url -> {
-            Optional<SiteEntity> existingSite = siteRepository.findByUrl(url);
-            if (existingSite.isPresent()) {
-                return existingSite.get();
-            } else {
-                SiteEntity newSite = new SiteEntity();
-                newSite.setUrl(site.getUrl());
-                newSite.setName(site.getName());
-                newSite.setStatus(SiteStatus.INDEXING.name());
-                newSite.setStatusTime(LocalDateTime.now());
-                try {
-                    siteRepository.save(newSite);
-                    log.info("Создана запись для сайта: {}", site.getUrl());
-                    return newSite;
-                } catch (Exception e) {
-                    log.error("Ошибка при создании записи для сайта {}: {}", site.getUrl(), e.getMessage());
-                    return null;
-                }
-            }
-        });
-        log.info("Завершение подготовки данных сайта: {}", site.getUrl());
-        return indexedSite;
     }
 
     private void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
@@ -217,10 +218,14 @@ public class SiteIndexingService {
     private void extractLinksAndIndexPages(Document document, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         log.info("Начало извлечения ссылок и индексации страниц: {}", document.baseUri());
         Elements links = document.select("a[href]");
-        for (Element link : links) {
+
+        ForkJoinPool forkJoinPool = new ForkJoinPool();
+
+        // Передаем задачи индексации каждой ссылки в ForkJoinPool
+        links.forEach(link -> {
             String nextUrl = link.absUrl("href");
             if (visitedUrls.putIfAbsent(nextUrl, true) == null && isInternalLink(nextUrl, siteEntity.getUrl())) {
-                CompletableFuture.runAsync(() -> {
+                forkJoinPool.submit(() -> {
                     try {
                         Document nextDocument = Jsoup.connect(nextUrl).get();
                         visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
@@ -229,9 +234,19 @@ public class SiteIndexingService {
                     }
                 });
             }
+        });
+
+        try {
+            forkJoinPool.shutdown();
+            forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            log.error("Ошибка при ожидании завершения индексации страниц: {}", e.getMessage());
+            Thread.currentThread().interrupt();
         }
+
         log.info("Завершение извлечения ссылок и индексации страниц: {}", document.baseUri());
     }
+
 
     private boolean isInternalLink(String url, String baseUrl) {
         try {
