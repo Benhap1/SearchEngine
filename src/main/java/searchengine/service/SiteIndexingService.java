@@ -38,9 +38,15 @@ public class SiteIndexingService {
 
     private AtomicInteger remainingPages; // Атомарная переменная для отслеживания оставшихся страниц
 
+    private volatile boolean stopRequested = false;
+
     @Transactional
     public void indexSites(List<Site> sites) {
         log.info("Начало индексации сайтов: {}", sites);
+
+        // Сброс флага остановки перед началом новой индексации
+        stopRequested = false;
+
         remainingPages = new AtomicInteger(sites.size()); // Инициализируем счетчик
 
         ForkJoinPool forkJoinPool = new ForkJoinPool(); // Создаем ForkJoinPool
@@ -119,15 +125,18 @@ public class SiteIndexingService {
         log.info("Статус индексации для сайта установлен: {}", site.getUrl());
     }
 
-
-    @Transactional
     public void stopIndexing() {
-        List<SiteEntity> sitesInProgress = siteRepository.findByStatus(SiteStatus.INDEXING.name());
-        for (SiteEntity site : sitesInProgress) {
-            site.setStatus(SiteStatus.FAILED.name());
-            site.setLastError("Индексация остановлена пользователем");
-            siteRepository.save(site);
-        }
+        stopRequested = true; // Установка флага для остановки индексации
+
+        // Присваиваем статус FAILED всем сайтам, которые индексируются в данный момент
+        siteRepository.findAll().forEach(siteEntity -> {
+            if (siteEntity.getStatus().equals(SiteStatus.INDEXING.name())) {
+                siteEntity.setStatus(SiteStatus.FAILED.name());
+                siteEntity.setStatusTime(LocalDateTime.now());
+                siteRepository.save(siteEntity);
+                log.info("Статус сайта {} установлен в FAILED", siteEntity.getUrl());
+            }
+        });
     }
 
     private void indexPages(String baseUrl, SiteEntity indexedSite) {
@@ -171,7 +180,12 @@ public class SiteIndexingService {
     }
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
+        if (stopRequested) {
+            log.info("Индексация остановлена пользователем.");
+            return null;
+        }
         log.info("Начало создания записи страницы: {}", url);
+
         String path;
         try {
             URL parsedUrl = new URL(url);
@@ -225,8 +239,16 @@ public class SiteIndexingService {
             String nextUrl = link.absUrl("href");
             if (visitedUrls.putIfAbsent(nextUrl, true) == null && isInternalLink(nextUrl, siteEntity.getUrl())) {
                 forkJoinPool.submit(() -> {
+                    if (stopRequested) {
+                        log.info("Индексация остановлена пользователем.");
+                        return;
+                    }
                     try {
                         Document nextDocument = Jsoup.connect(nextUrl).get();
+                        if (stopRequested) {
+                            log.info("Индексация остановлена пользователем.");
+                            return;
+                        }
                         visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
                     } catch (IOException e) {
                         log.error("Ошибка при получении страницы {}: {}", nextUrl, e.getMessage());
@@ -263,9 +285,16 @@ public class SiteIndexingService {
     }
 
     private void updateSiteStatus(SiteEntity siteEntity) {
-        log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
-        siteEntity.setStatus(SiteStatus.INDEXED.name());
-        siteEntity.setStatusTime(LocalDateTime.now());
+        if (stopRequested) {
+            log.info("Индексация остановлена пользователем.");
+            siteEntity.setStatus(SiteStatus.FAILED.name());
+            siteRepository.save(siteEntity);
+        } else {
+            log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
+            siteEntity.setStatus(SiteStatus.INDEXED.name());
+            siteEntity.setStatusTime(LocalDateTime.now());
+        }
+
         try {
             siteRepository.save(siteEntity);
             log.info("Завершение обновления статуса сайта: {}", siteEntity.getUrl());

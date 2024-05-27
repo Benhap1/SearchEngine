@@ -2,6 +2,8 @@ indexing-settings:
   sites:
   - url: https://www.sendel.ru
     name: Sendel.Ru
+  - url: https://www.skillbox.ru
+    name: Skillbox.Ru
 spring:
   datasource:
     url: jdbc:mysql://localhost:3306/db
