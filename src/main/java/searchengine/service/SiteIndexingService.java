@@ -315,4 +315,47 @@ public class SiteIndexingService {
             log.error(saveError, ex);
         }
     }
+    public boolean indexPage(String url) throws MalformedURLException {
+        URL parsedUrl = new URL(url);
+        String host = parsedUrl.getHost();
+
+        // Поиск сайта в базе данных по доменному имени
+        Optional<SiteEntity> optionalSiteEntity = siteRepository.findByUrlContaining(host);
+        if (optionalSiteEntity.isEmpty()) {
+            return false; // Сайт не найден
+        }
+
+        SiteEntity siteEntity = optionalSiteEntity.get();
+
+        // Создание или обновление страницы
+        indexPageEntity(siteEntity, url);
+
+        return true;
+    }
+
+    private void indexPageEntity(SiteEntity siteEntity, String url) {
+        try {
+            Document document = Jsoup.connect(url).get();
+            String path = new URL(url).getPath();
+
+            // Проверка, существует ли уже запись о странице
+            Optional<PageEntity> existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
+            PageEntity pageEntity = existingPage.orElse(new PageEntity());
+
+            // Обновление данных страницы
+            pageEntity.setSite(siteEntity);
+            pageEntity.setPath(path);
+            pageEntity.setContent(document.outerHtml());
+
+            int statusCode = Jsoup.connect(url).execute().statusCode();
+            pageEntity.setCode(statusCode);
+
+            // Сохранение или обновление записи в базе данных
+            pageRepository.save(pageEntity);
+            log.info("Страница {} успешно индексирована", url);
+        } catch (IOException e) {
+            log.error("Ошибка при индексации страницы {}: {}", url, e.getMessage());
+        }
+    }
+
 }

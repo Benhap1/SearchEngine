@@ -5,7 +5,7 @@
 
     <changeSet id="create-table-site" author="ben4in">
         <createTable tableName="site">
-            <column name="id" type="INT">
+            <column name="id" type="INT" autoIncrement="true">
                 <constraints primaryKey="true" nullable="false"/>
             </column>
             <column name="status" type="ENUM('INDEXING', 'INDEXED', 'FAILED')">

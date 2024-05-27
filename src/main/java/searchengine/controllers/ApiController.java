@@ -1,13 +1,15 @@
 package searchengine.controllers;
 
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import searchengine.config.SitesList;
 import searchengine.dto.statistics.StatisticsResponse;
 import searchengine.service.SiteIndexingService;
 import searchengine.services.StatisticsService;
+
+import java.net.MalformedURLException;
+import java.util.HashMap;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api")
@@ -52,6 +54,27 @@ public class ApiController {
             indexingInProgress = false;
             siteIndexingService.stopIndexing();
             return ResponseEntity.ok("{\"result\": true}");
+        }
+    }
+
+    @PostMapping("/indexPage")
+    public ResponseEntity<Map<String, Object>> indexPage(@RequestParam String url) {
+        Map<String, Object> response = new HashMap<>();
+
+        try {
+            boolean result = siteIndexingService.indexPage(url);
+            if (!result) {
+                response.put("result", false);
+                response.put("error", "Данная страница находится за пределами сайтов, указанных в конфигурационном файле");
+                return ResponseEntity.ok(response);
+            }
+
+            response.put("result", true);
+            return ResponseEntity.ok(response);
+        } catch (MalformedURLException e) {
+            response.put("result", false);
+            response.put("error", "Неправильный URL: " + url);
+            return ResponseEntity.badRequest().body(response);
         }
     }
 }

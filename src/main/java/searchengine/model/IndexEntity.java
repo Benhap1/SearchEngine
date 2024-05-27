@@ -5,7 +5,7 @@ import lombok.Data;
 
 @Data
 @Entity
-@Table(name = "index")
+@Table(name = "indexx")
 public class IndexEntity {
 
     @Id
@@ -21,7 +21,7 @@ public class IndexEntity {
     @JoinColumn(name = "lemma_id", nullable = false)
     private LemmaEntity lemma;
 
-    @Column(name = "rank", nullable = false)
+    @Column(name = "rankk", nullable = false)
     private Float rank;
 
 }
