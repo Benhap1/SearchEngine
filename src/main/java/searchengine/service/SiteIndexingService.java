@@ -8,9 +8,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import searchengine.config.Site;
-import searchengine.model.PageEntity;
-import searchengine.model.SiteEntity;
-import searchengine.model.SiteStatus;
+import searchengine.model.*;
+import searchengine.repository.IndexRepository;
+import searchengine.repository.LemmaRepository;
 import searchengine.repository.PageRepository;
 import searchengine.repository.SiteRepository;
 import java.io.IOException;
@@ -18,6 +18,7 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -32,6 +33,15 @@ public class SiteIndexingService {
 
     @Autowired
     private PageRepository pageRepository;
+
+    @Autowired
+    private LemmaRepository lemmaRepository;
+
+    @Autowired
+    private IndexRepository indexRepository;
+
+    @Autowired
+    private LemmaFinder lemmaFinder;
 
     // Кэш проверки существования URL страниц
     private final ConcurrentHashMap<String, Boolean> pageUrlCache = new ConcurrentHashMap<>();
@@ -72,6 +82,7 @@ public class SiteIndexingService {
         pageUrlCache.clear();
         log.info("Кэш страниц очищен.");
     }
+
 
     private void indexSite(Site site) {
         log.info("Начало индексации сайта: {}", site.getUrl());
@@ -154,6 +165,7 @@ public class SiteIndexingService {
         }
     }
 
+
     private void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         log.info("Начало обработки страницы: {}", url);
         visitedUrls.putIfAbsent(url, true);
@@ -169,6 +181,12 @@ public class SiteIndexingService {
             return;
         }
 
+        // Интеграция лемматизации и сохранения лемм и индексов
+        Map<String, Integer> lemmas = lemmaFinder.collectLemmas(pageEntity.getContent());
+
+        // Обновление лемм и индексов
+        saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
+
         extractLinksAndIndexPages(document, siteEntity, visitedUrls);
 
         int remaining = remainingPages.decrementAndGet();
@@ -178,6 +196,7 @@ public class SiteIndexingService {
 
         log.info("Завершение обработки страницы: {}", url);
     }
+
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
         if (stopRequested) {
@@ -353,9 +372,46 @@ public class SiteIndexingService {
             // Сохранение или обновление записи в базе данных
             pageRepository.save(pageEntity);
             log.info("Страница {} успешно индексирована", url);
+
+            // Лемматизация текста страницы
+            Map<String, Integer> lemmas = lemmaFinder.collectLemmas(document.text());
+
+            // Обработка и сохранение лемм и индексов
+            saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
+
         } catch (IOException e) {
             log.error("Ошибка при индексации страницы {}: {}", url, e.getMessage());
         }
+    }
+
+
+    public void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
+        lemmas.forEach((lemmaText, count) -> {
+            // Поиск леммы в базе данных
+            Optional<LemmaEntity> optionalLemmaEntity = lemmaRepository.findByLemma(lemmaText);
+            LemmaEntity lemmaEntity;
+            if (optionalLemmaEntity.isPresent()) {
+                // Лемма уже существует
+                lemmaEntity = optionalLemmaEntity.get();
+                lemmaEntity.setFrequency(lemmaEntity.getFrequency() + 1); // Увеличиваем частоту
+            } else {
+                // Леммы нет в базе данных, создаем новую
+                lemmaEntity = new LemmaEntity();
+                lemmaEntity.setLemma(lemmaText);
+                lemmaEntity.setFrequency(1); // Устанавливаем частоту равной 1
+            }
+            lemmaEntity.setSite(siteEntity);
+
+            // Сохранение леммы
+            lemmaRepository.save(lemmaEntity);
+
+            // Создание записи в таблице index
+            IndexEntity indexEntity = new IndexEntity();
+            indexEntity.setPage(pageEntity);
+            indexEntity.setLemma(lemmaEntity);
+            indexEntity.setRank(count.floatValue());
+            indexRepository.save(indexEntity);
+        });
     }
 
 }

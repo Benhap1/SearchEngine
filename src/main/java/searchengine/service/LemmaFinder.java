@@ -5,35 +5,28 @@ import org.apache.lucene.morphology.LuceneMorphology;
 import org.apache.lucene.morphology.russian.RussianLuceneMorphology;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PostConstruct;
+
 import java.io.IOException;
 import java.util.*;
 
+@Service
 @Slf4j
-//@Service
 public class LemmaFinder {
-    private final LuceneMorphology luceneMorphology;
+
+    private LuceneMorphology luceneMorphology;
     private static final String WORD_TYPE_REGEX = "\\W\\w&&[^а-яА-Я\\s]";
     private static final String[] particlesNames = new String[]{"МЕЖД", "ПРЕДЛ", "СОЮЗ"};
 
-    public static LemmaFinder getInstance() throws IOException {
-        LuceneMorphology morphology= new RussianLuceneMorphology();
-        return new LemmaFinder(morphology);
+    @PostConstruct
+    public void init() {
+        try {
+            this.luceneMorphology = new RussianLuceneMorphology();
+        } catch (IOException e) {
+            throw new RuntimeException("Ошибка при инициализации LuceneMorphology", e);
+        }
     }
 
-    private LemmaFinder(LuceneMorphology luceneMorphology) {
-        this.luceneMorphology = luceneMorphology;
-    }
-
-    private LemmaFinder(){
-        throw new RuntimeException("Disallow construct");
-    }
-
-    /**
-     * Метод разделяет текст на слова, находит все леммы и считает их количество.
-     *
-     * @param text текст из которого будут выбираться леммы
-     * @return ключ является леммой, а значение количеством найденных лемм
-     */
     public Map<String, Integer> collectLemmas(String text) {
         String[] words = arrayContainsRussianWords(text);
         HashMap<String, Integer> lemmas = new HashMap<>();
@@ -55,21 +48,12 @@ public class LemmaFinder {
 
             String normalWord = normalForms.get(0);
 
-            if (lemmas.containsKey(normalWord)) {
-                lemmas.put(normalWord, lemmas.get(normalWord) + 1);
-            } else {
-                lemmas.put(normalWord, 1);
-            }
+            lemmas.put(normalWord, lemmas.getOrDefault(normalWord, 0) + 1);
         }
 
         return lemmas;
     }
 
-
-    /**
-     * @param text текст из которого собираем все леммы
-     * @return набор уникальных лемм найденных в тексте
-     */
     public Set<String> getLemmaSet(String text) {
         String[] textArray = arrayContainsRussianWords(text);
         Set<String> lemmaSet = new HashSet<>();
