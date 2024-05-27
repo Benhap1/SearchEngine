@@ -3,8 +3,8 @@
                    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
                    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.1.xsd">
 
-    <changeSet id="create-table-index" author="ben4in">
-        <createTable tableName="index">
+    <changeSet id="create-table-indexx" author="ben4in">
+        <createTable tableName="indexx">
             <column name="id" type="INT">
                 <constraints primaryKey="true" nullable="false"/>
             </column>
@@ -14,7 +14,7 @@
             <column name="lemma_id" type="INT">
                 <constraints nullable="false"/>
             </column>
-            <column name="rank" type="FLOAT">
+            <column name="rankk" type="FLOAT">
                 <constraints nullable="false"/>
             </column>
         </createTable>

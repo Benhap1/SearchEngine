@@ -9,6 +9,6 @@
     <include file="db/changelog/001-create-table-site.xml"/>
     <include file="db/changelog/002-create-table-page.xml"/>
     <include file="db/changelog/003-create-table-lemma.xml"/>
-    <include file="db/changelog/004-create-table-index.xml"/>
+    <include file="/db/changelog/004-create-table-indexx.xml"/>
     <include file="db/changelog/005-create-foreign-keys.xml"/>
 </databaseChangeLog>

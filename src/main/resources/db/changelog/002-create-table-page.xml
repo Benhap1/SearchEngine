@@ -27,7 +27,7 @@
                                  constraintName="page_fk"
                                  referencedColumnNames="id"
                                  referencedTableName="site"/>
-        <createIndex tableName="page" indexName="path_index" unique="false">
+        <createIndex tableName="page" indexName="path_indexx" unique="false">
             <column name="path" type="VARCHAR(255)"/>
         </createIndex>
     </changeSet>

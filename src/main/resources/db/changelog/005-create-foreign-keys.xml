@@ -19,18 +19,18 @@
                                  referencedTableName="site"/>
     </changeSet>
 
-    <changeSet id="add-foreign-key-index-page_id" author="ben4in">
+    <changeSet id="add-foreign-key-indexx-page_id" author="ben4in">
         <addForeignKeyConstraint baseColumnNames="page_id"
-                                 baseTableName="index"
-                                 constraintName="index_page_fk"
+                                 baseTableName="indexx"
+                                 constraintName="indexx_page_fk"
                                  referencedColumnNames="id"
                                  referencedTableName="page"/>
     </changeSet>
 
     <changeSet id="add-foreign-key-index-lemma_id" author="ben4in">
         <addForeignKeyConstraint baseColumnNames="lemma_id"
-                                 baseTableName="index"
-                                 constraintName="lemma_fk_index"
+                                 baseTableName="indexx"
+                                 constraintName="lemma_fk_indexx"
                                  referencedColumnNames="id"
                                  referencedTableName="lemma"/>
     </changeSet>
