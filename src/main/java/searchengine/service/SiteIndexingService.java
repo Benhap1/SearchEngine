@@ -8,9 +8,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import searchengine.config.Site;
-import searchengine.model.PageEntity;
-import searchengine.model.SiteEntity;
-import searchengine.model.SiteStatus;
+import searchengine.model.*;
+import searchengine.repository.IndexRepository;
+import searchengine.repository.LemmaRepository;
 import searchengine.repository.PageRepository;
 import searchengine.repository.SiteRepository;
 import java.io.IOException;
@@ -18,10 +18,9 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-
 
 @Slf4j
 @Service
@@ -33,10 +32,17 @@ public class SiteIndexingService {
     @Autowired
     private PageRepository pageRepository;
 
+    @Autowired
+    private LemmaRepository lemmaRepository;
+
+    @Autowired
+    private IndexRepository indexRepository;
+
+    @Autowired
+    private LemmaFinder lemmaFinder;
+
     // Кэш проверки существования URL страниц
     private final ConcurrentHashMap<String, Boolean> pageUrlCache = new ConcurrentHashMap<>();
-
-    private AtomicInteger remainingPages; // Атомарная переменная для отслеживания оставшихся страниц
 
     private volatile boolean stopRequested = false;
 
@@ -47,31 +53,39 @@ public class SiteIndexingService {
         // Сброс флага остановки перед началом новой индексации
         stopRequested = false;
 
-        remainingPages = new AtomicInteger(sites.size()); // Инициализируем счетчик
-
-        ForkJoinPool forkJoinPool = new ForkJoinPool(); // Создаем ForkJoinPool
-
-        forkJoinPool.submit(() -> sites.parallelStream().forEach(this::indexSite)); // Используем ForkJoinPool для выполнения задач
-
+        ForkJoinPool forkJoinPool = new ForkJoinPool();
         try {
+            forkJoinPool.submit(() -> sites.parallelStream().forEach(this::indexSite));
+
             forkJoinPool.shutdown();
-            forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+            boolean terminated = forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+
+            if (!terminated) {
+                log.warn("ForkJoinPool не завершился в указанный срок");
+            }
 
             // Очистка кэша после завершения всех задач
             clearCache();
-
         } catch (InterruptedException e) {
             log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
+        } finally {
+            if (!forkJoinPool.isTerminated()) {
+                log.warn("Принудительное завершение незавершенных задач в ForkJoinPool");
+                forkJoinPool.shutdownNow();
+            }
         }
 
         log.info("Конец индексации сайтов: {}", sites);
     }
 
+
+
     private void clearCache() {
         pageUrlCache.clear();
         log.info("Кэш страниц очищен.");
     }
+
 
     private void indexSite(Site site) {
         log.info("Начало индексации сайта: {}", site.getUrl());
@@ -154,6 +168,7 @@ public class SiteIndexingService {
         }
     }
 
+
     private void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         log.info("Начало обработки страницы: {}", url);
         visitedUrls.putIfAbsent(url, true);
@@ -169,15 +184,18 @@ public class SiteIndexingService {
             return;
         }
 
+        // Интеграция лемматизации и сохранения лемм и индексов
+        Map<String, Integer> lemmas = lemmaFinder.collectLemmas(pageEntity.getContent());
+
+//         Обновление лемм и индексов
+        saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
+
         extractLinksAndIndexPages(document, siteEntity, visitedUrls);
 
-        int remaining = remainingPages.decrementAndGet();
-        if (remaining == 0) {
-            log.info("Все страницы сайта обработаны. Завершение индексации.");
-        }
 
         log.info("Завершение обработки страницы: {}", url);
     }
+
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
         if (stopRequested) {
@@ -233,36 +251,45 @@ public class SiteIndexingService {
         Elements links = document.select("a[href]");
 
         ForkJoinPool forkJoinPool = new ForkJoinPool();
-
-        // Передаем задачи индексации каждой ссылки в ForkJoinPool
-        links.forEach(link -> {
-            String nextUrl = link.absUrl("href");
-            if (visitedUrls.putIfAbsent(nextUrl, true) == null && isInternalLink(nextUrl, siteEntity.getUrl())) {
-                forkJoinPool.submit(() -> {
-                    if (stopRequested) {
-                        log.info("Индексация остановлена пользователем.");
-                        return;
-                    }
-                    try {
-                        Document nextDocument = Jsoup.connect(nextUrl).get();
+        try {
+            // Передаем задачи индексации каждой ссылки в ForkJoinPool
+            links.forEach(link -> {
+                String nextUrl = link.absUrl("href");
+                if (visitedUrls.putIfAbsent(nextUrl, true) == null && isInternalLink(nextUrl, siteEntity.getUrl())) {
+                    forkJoinPool.submit(() -> {
                         if (stopRequested) {
                             log.info("Индексация остановлена пользователем.");
                             return;
                         }
-                        visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
-                    } catch (IOException e) {
-                        log.error("Ошибка при получении страницы {}: {}", nextUrl, e.getMessage());
-                    }
-                });
-            }
-        });
+                        try {
+                            Document nextDocument = Jsoup.connect(nextUrl).get();
+                            if (stopRequested) {
+                                log.info("Индексация остановлена пользователем.");
+                                return;
+                            }
+                            visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
+                        } catch (IOException e) {
+                            log.error("Ошибка при получении страницы {}: {}", nextUrl, e.getMessage());
+                        }
+                    });
+                }
+            });
 
-        try {
             forkJoinPool.shutdown();
-            forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+            boolean terminated = forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+
+            if (!terminated) {
+                log.warn("ForkJoinPool не завершился в указанный срок");
+            }
+
         } catch (InterruptedException e) {
             log.error("Ошибка при ожидании завершения индексации страниц: {}", e.getMessage());
             Thread.currentThread().interrupt();
+        } finally {
+            if (!forkJoinPool.isTerminated()) {
+                log.warn("Принудительное завершение незавершенных задач в ForkJoinPool");
+                forkJoinPool.shutdownNow();
+            }
         }
 
         log.info("Завершение извлечения ссылок и индексации страниц: {}", document.baseUri());
@@ -353,9 +380,45 @@ public class SiteIndexingService {
             // Сохранение или обновление записи в базе данных
             pageRepository.save(pageEntity);
             log.info("Страница {} успешно индексирована", url);
+
+            // Лемматизация текста страницы
+            Map<String, Integer> lemmas = lemmaFinder.collectLemmas(document.text());
+
+            // Обработка и сохранение лемм и индексов
+            saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
+
         } catch (IOException e) {
             log.error("Ошибка при индексации страницы {}: {}", url, e.getMessage());
         }
+    }
+
+    public void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
+        lemmas.forEach((lemmaText, count) -> {
+            // Поиск леммы в базе данных
+            Optional<LemmaEntity> optionalLemmaEntity = lemmaRepository.findByLemma(lemmaText);
+            LemmaEntity lemmaEntity;
+            if (optionalLemmaEntity.isPresent()) {
+                // Лемма уже существует
+                lemmaEntity = optionalLemmaEntity.get();
+                lemmaEntity.setFrequency(lemmaEntity.getFrequency() + 1); // Увеличиваем частоту
+            } else {
+                // Леммы нет в базе данных, создаем новую
+                lemmaEntity = new LemmaEntity();
+                lemmaEntity.setLemma(lemmaText);
+                lemmaEntity.setFrequency(1); // Устанавливаем частоту равной 1
+            }
+            lemmaEntity.setSite(siteEntity);
+
+            // Сохранение леммы
+            lemmaRepository.save(lemmaEntity);
+
+            // Создание записи в таблице index
+            IndexEntity indexEntity = new IndexEntity();
+            indexEntity.setPage(pageEntity);
+            indexEntity.setLemma(lemmaEntity);
+            indexEntity.setRank(count.floatValue());
+            indexRepository.save(indexEntity);
+        });
     }
 
 }

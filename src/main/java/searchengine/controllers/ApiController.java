@@ -71,10 +71,12 @@ public class ApiController {
 
             response.put("result", true);
             return ResponseEntity.ok(response);
-        } catch (MalformedURLException e) {
+        } catch (RuntimeException e) {
             response.put("result", false);
-            response.put("error", "Неправильный URL: " + url);
+            response.put("error", e.getMessage());
             return ResponseEntity.badRequest().body(response);
+        } catch (MalformedURLException e) {
+            throw new RuntimeException(e);
         }
     }
 }
