@@ -414,5 +414,4 @@ public class SiteIndexingService {
             indexRepository.save(indexEntity);
         });
     }
-
 }
