@@ -381,12 +381,6 @@ public class SiteIndexingService {
             pageRepository.save(pageEntity);
             log.info("Страница {} успешно индексирована", url);
 
-            // Лемматизация текста страницы
-            Map<String, Integer> lemmas = lemmaFinder.collectLemmas(document.text());
-
-            // Обработка и сохранение лемм и индексов
-            saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
-
         } catch (IOException e) {
             log.error("Ошибка при индексации страницы {}: {}", url, e.getMessage());
         }
