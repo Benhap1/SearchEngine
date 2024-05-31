@@ -1,11 +1,26 @@
 indexing-settings:
   sites:
-  - url: https://www.sendel.ru
-    name: Sendel.Ru
+    - url: https://www.sendel.ru
+      name: Sendel.Ru
+  fork-join-pool:
+    parallelism: 4
 spring:
   datasource:
     url: jdbc:mysql://localhost:3306/db
     username: root
     password: Benjamin1*
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 200
+      minimum-idle: 100
+      idle-timeout: 600000
+      connection-timeout: 600000
+      max-lifetime: 1800000
+
   liquibase:
     change-log: classpath:/db/changelog/changelog.xml
+
+logging:
+  level:
+    com.zaxxer.hikari: DEBUG
+    java.util.concurrent.ForkJoinPool: DEBUG
