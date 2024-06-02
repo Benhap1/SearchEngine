@@ -1,6 +1,5 @@
 package searchengine.service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.lettuce.core.api.sync.RedisCommands;
 import lombok.extern.slf4j.Slf4j;
@@ -21,10 +20,7 @@ import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -61,63 +57,6 @@ public class SiteIndexingService {
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
 
-    // Кэш для результатов лемматизации
-    private final String LEMMA_CACHE_PREFIX = "lemmaCache:";
-
-    // Кэш для проверок существования лемм
-    private final String LEMMA_EXISTENCE_CACHE_PREFIX = "lemmaExistenceCache:";
-
-    public Map<String, Integer> getCachedLemmas(String content) {
-        String key = LEMMA_CACHE_PREFIX + content.hashCode();
-        String cachedLemmas = redisCommands.get(key);
-        if (cachedLemmas != null) {
-            try {
-                Map<String, Object> tempMap = objectMapper.readValue(cachedLemmas, Map.class);
-                Map<String, Integer> result = new HashMap<>();
-                for (Map.Entry<String, Object> entry : tempMap.entrySet()) {
-                    result.put(entry.getKey(), (Integer) entry.getValue());
-                }
-                return result;
-            } catch (JsonProcessingException e) {
-                log.error("Ошибка при десериализации кэша лемм", e);
-            }
-        }
-        return null;
-    }
-
-    public void cacheLemmas(String content, Map<String, Integer> lemmas) {
-        String key = LEMMA_CACHE_PREFIX + content.hashCode();
-        try {
-            String value = objectMapper.writeValueAsString(lemmas);
-            redisCommands.set(key, value);
-        } catch (JsonProcessingException e) {
-            log.error("Ошибка при сериализации кэша лемм", e);
-        }
-    }
-
-    public LemmaEntity getCachedLemma(String lemma) {
-        String key = LEMMA_EXISTENCE_CACHE_PREFIX + lemma;
-        String cachedLemma = redisCommands.get(key);
-        if (cachedLemma != null) {
-            try {
-                return objectMapper.readValue(cachedLemma, LemmaEntity.class);
-            } catch (JsonProcessingException e) {
-                log.error("Ошибка при десериализации кэша лемм", e);
-            }
-        }
-        return null;
-    }
-
-    public void cacheLemma(LemmaEntity lemmaEntity) {
-        String key = LEMMA_EXISTENCE_CACHE_PREFIX + lemmaEntity.getLemma();
-        try {
-            String value = objectMapper.writeValueAsString(lemmaEntity);
-            redisCommands.set(key, value);
-        } catch (JsonProcessingException e) {
-            log.error("Ошибка при сериализации кэша лемм", e);
-        }
-    }
-
     @Transactional
     public void indexSites(List<Site> sites) {
         log.info("Начало индексации сайтов: {}", sites);
@@ -134,6 +73,8 @@ public class SiteIndexingService {
             if (!terminated) {
                 log.warn("ForkJoinPool не завершился в указанный срок");
             }
+
+            mergeLemmas();
 
             clearCache();
         } catch (InterruptedException e) {
@@ -163,6 +104,7 @@ public class SiteIndexingService {
                 .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
 
         indexPages(site.getUrl(), indexedSite);
+
 
         updateSiteStatus(indexedSite);
 
@@ -225,7 +167,6 @@ public class SiteIndexingService {
         }
     }
 
-
     private void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         log.info("Начало обработки страницы: {}", url);
         visitedUrls.putIfAbsent(url, true);
@@ -241,19 +182,12 @@ public class SiteIndexingService {
             return;
         }
 
-        Map<String, Integer> lemmas = getCachedLemmas(pageEntity.getContent());
-        if (lemmas == null) {
-            lemmas = lemmaFinder.collectLemmas(pageEntity.getContent());
-            cacheLemmas(pageEntity.getContent(), lemmas);
-        }
-
+        Map<String, Integer> lemmas = lemmaFinder.collectLemmas(pageEntity.getContent());
         saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
-
         extractLinksAndIndexPages(document, siteEntity, visitedUrls);
 
         log.info("Завершение обработки страницы: {}", url);
     }
-
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
         if (stopRequested) {
@@ -352,9 +286,6 @@ public class SiteIndexingService {
         log.info("Завершение извлечения ссылок и индексации страниц: {}", document.baseUri());
     }
 
-
-
-
     private boolean isInternalLink(String url, String baseUrl) {
         try {
             URL nextUrl = new URL(url);
@@ -390,33 +321,117 @@ public class SiteIndexingService {
     }
 
     public void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
-        lemmas.forEach((lemmaText, count) -> {
-            LemmaEntity lemmaEntity = getCachedLemma(lemmaText);
-            if (lemmaEntity == null) {
-                Optional<LemmaEntity> optionalLemmaEntity = lemmaRepository.findByLemma(lemmaText);
-                if (optionalLemmaEntity.isPresent()) {
-                    lemmaEntity = optionalLemmaEntity.get();
-                    lemmaEntity.setFrequency(lemmaEntity.getFrequency() + 1);
-                } else {
-                    lemmaEntity = new LemmaEntity();
-                    lemmaEntity.setLemma(lemmaText);
-                    lemmaEntity.setFrequency(1);
-                }
-                lemmaEntity.setSite(siteEntity);
-                lemmaEntity = lemmaRepository.save(lemmaEntity);
-                cacheLemma(lemmaEntity);
-            } else {
-                lemmaEntity.setFrequency(lemmaEntity.getFrequency() + 1);
-                lemmaEntity = lemmaRepository.save(lemmaEntity);
-                cacheLemma(lemmaEntity);
-            }
+        int batchSize = 5000;
+        List<LemmaEntity> lemmaEntities = new ArrayList<>();
+        List<IndexEntity> indexEntities = new ArrayList<>();
+
+        int count = 0;
+        for (Map.Entry<String, Integer> entry : lemmas.entrySet()) {
+            LemmaEntity lemmaEntity = new LemmaEntity();
+            lemmaEntity.setLemma(entry.getKey());
+            lemmaEntity.setFrequency(1);
+            lemmaEntity.setSite(siteEntity);
+            lemmaEntities.add(lemmaEntity);
+
             IndexEntity indexEntity = new IndexEntity();
             indexEntity.setPage(pageEntity);
             indexEntity.setLemma(lemmaEntity);
-            indexEntity.setRank(count.floatValue());
-            indexRepository.save(indexEntity);
-        });
+            indexEntity.setRank(entry.getValue().floatValue());
+            indexEntities.add(indexEntity);
+
+            count++;
+
+            if (count % batchSize == 0) {
+                // Сохранение лемм и индексов в базу данных
+                try {
+                    lemmaRepository.saveAll(lemmaEntities);
+                    indexRepository.saveAll(indexEntities);
+                } catch (Exception e) {
+                    log.error("Ошибка при сохранении лемм и индексов: {}", e.getMessage());
+                }
+
+                // Очистка списков для следующего пакета
+                lemmaEntities.clear();
+                indexEntities.clear();
+            }
+        }
+
+        // Сохранение оставшихся лемм и индексов, если есть
+        if (!lemmaEntities.isEmpty()) {
+            try {
+                lemmaRepository.saveAll(lemmaEntities);
+                indexRepository.saveAll(indexEntities);
+            } catch (Exception e) {
+                log.error("Ошибка при сохранении лемм и индексов: {}", e.getMessage());
+            }
+        }
+
     }
+
+    public void mergeLemmas() {
+        log.info("Начало объединения дублирующихся лемм.");
+
+        try {
+            // Получение всех лемм и индексов
+            List<LemmaEntity> allLemmas = lemmaRepository.findAll();
+            List<IndexEntity> allIndices = indexRepository.findAll();
+
+            // Подсчет частоты каждой леммы
+            Map<String, Integer> lemmaFrequencyMap = new HashMap<>();
+            for (LemmaEntity lemma : allLemmas) {
+                lemmaFrequencyMap.merge(lemma.getLemma(), lemma.getFrequency(), Integer::sum);
+            }
+
+            log.info("Количество уникальных лемм: {}", lemmaFrequencyMap.size());
+
+            // Создание отображения лемм к спискам связанных страниц
+            Map<String, List<PageEntity>> lemmaPagesMap = new HashMap<>();
+            for (IndexEntity index : allIndices) {
+                LemmaEntity lemma = index.getLemma();
+                PageEntity page = index.getPage();
+                lemmaPagesMap.computeIfAbsent(lemma.getLemma(), k -> new ArrayList<>()).add(page);
+            }
+
+            // Удаление всех записей из таблицы индексов
+            indexRepository.deleteAll();
+
+            // Получение site_id для всех лемм
+            Optional<LemmaEntity> firstLemma = allLemmas.stream().findFirst();
+            SiteEntity siteForLemmas = firstLemma.map(LemmaEntity::getSite).orElse(null);
+
+            // Удаление всех записей из таблицы лемм
+            lemmaRepository.deleteAll();
+
+            // Обновление частоты лемм и сохранение индексов
+            List<LemmaEntity> mergedLemmas = new ArrayList<>();
+            List<IndexEntity> mergedIndices = new ArrayList<>();
+            for (Map.Entry<String, Integer> entry : lemmaFrequencyMap.entrySet()) {
+                LemmaEntity lemmaEntity = new LemmaEntity();
+                lemmaEntity.setLemma(entry.getKey());
+                lemmaEntity.setFrequency(entry.getValue());
+                lemmaEntity.setSite(siteForLemmas); // Установка site_id для каждой леммы
+                mergedLemmas.add(lemmaEntity);
+
+                List<PageEntity> relatedPages = lemmaPagesMap.getOrDefault(entry.getKey(), new ArrayList<>());
+                for (PageEntity page : relatedPages) {
+                    IndexEntity indexEntity = new IndexEntity();
+                    indexEntity.setLemma(lemmaEntity);
+                    indexEntity.setPage(page);
+                    indexEntity.setRank(entry.getValue().floatValue()); // Обновление частоты в индексе
+                    mergedIndices.add(indexEntity);
+                }
+            }
+
+            // Сохранение обновленных лемм и индексов
+            lemmaRepository.saveAll(mergedLemmas);
+            indexRepository.saveAll(mergedIndices);
+
+            log.info("Завершено объединение лемм и обновление индексов.");
+        } catch (Exception e) {
+            log.error("Ошибка при объединении лемм и обновлении индексов: {}", e.getMessage());
+        }
+    }
+
 
     private void handleIndexingError(SiteEntity indexedSite, IOException e) {
         String errorMessage = "Ошибка при индексации сайта " + indexedSite.getUrl() + ": " + e.getMessage();
