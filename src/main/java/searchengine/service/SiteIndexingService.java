@@ -74,9 +74,13 @@ public class SiteIndexingService {
                 log.warn("ForkJoinPool не завершился в указанный срок");
             }
 
-            mergeLemmas();
+            if (!stopRequested) {
+                mergeLemmas();
+                clearCache();
+            } else {
+                log.info("Индексация была остановлена пользователем.");
+            }
 
-            clearCache();
         } catch (InterruptedException e) {
             log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
@@ -96,6 +100,9 @@ public class SiteIndexingService {
     }
 
     private void indexSite(Site site) {
+
+        if (stopRequested) return;
+
         log.info("Начало индексации сайта: {}", site.getUrl());
 
         updateSiteIndexingStatus(site);
@@ -153,6 +160,9 @@ public class SiteIndexingService {
     }
 
     private void indexPages(String baseUrl, SiteEntity indexedSite) {
+
+        if (stopRequested) return;
+
         log.info("Начало индексации страниц сайта: {}", baseUrl);
         try {
             Document document = Jsoup.connect(baseUrl).get();
@@ -168,6 +178,7 @@ public class SiteIndexingService {
     }
 
     private void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
+        if (stopRequested) return;
         log.info("Начало обработки страницы: {}", url);
         visitedUrls.putIfAbsent(url, true);
 
@@ -190,10 +201,10 @@ public class SiteIndexingService {
     }
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
-        if (stopRequested) {
-            log.info("Индексация остановлена пользователем.");
-            return null;
-        }
+//        if (stopRequested) {
+//            log.info("Индексация остановлена пользователем.");
+//            return null;
+//        }
         log.info("Начало создания записи страницы: {}", url);
 
         String path;
@@ -239,6 +250,7 @@ public class SiteIndexingService {
     }
 
     private void extractLinksAndIndexPages(Document document, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
+        if (stopRequested) return;
         log.info("Начало извлечения ссылок и индексации страниц: {}", document.baseUri());
         Elements links = document.select("a[href]");
 
