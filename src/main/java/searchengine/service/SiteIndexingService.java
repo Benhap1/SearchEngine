@@ -67,10 +67,7 @@ public class SiteIndexingService {
             if (!terminated) {
                 log.warn("ForkJoinPool не завершился в указанный срок");
             }
-
-            if (!stopRequested) {
-                mergeLemmas();
-            } else {
+            if (stopRequested) {
                 log.info("Индексация была остановлена пользователем.");
             }
         } catch (InterruptedException e) {
@@ -98,6 +95,25 @@ public class SiteIndexingService {
         if (stopRequested) return;
 
         log.info("Начало индексации сайта: {}", site.getUrl());
+
+        // Обновляем статус индексации сайта
+        updateSiteIndexingStatus(site);
+
+        SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
+                .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
+
+        indexPages(site.getUrl(), indexedSite);
+
+        updateSiteStatus(indexedSite);
+
+        log.info("Завершение индексации сайта: {}", site.getUrl());
+
+        mergeLemmas();
+    }
+
+
+    private void updateSiteIndexingStatus(Site site) {
+        log.info("Установка статуса индексации для сайта: {}", site.getUrl());
 
         // Проверяем наличие записей в таблицах и удаляем их, если они существуют
         if (indexRepository.count() > 0) {
@@ -127,31 +143,6 @@ public class SiteIndexingService {
         } else {
             log.info("Таблица site пуста, удаление пропущено");
         }
-        // Обновляем статус индексации сайта
-        updateSiteIndexingStatus(site);
-
-        SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
-                .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
-
-        indexPages(site.getUrl(), indexedSite);
-
-        updateSiteStatus(indexedSite);
-
-        log.info("Завершение индексации сайта: {}", site.getUrl());
-    }
-
-
-    private void updateSiteIndexingStatus(Site site) {
-        log.info("Установка статуса индексации для сайта: {}", site.getUrl());
-        Optional<SiteEntity> existingSite = siteRepository.findByUrl(site.getUrl());
-        existingSite.ifPresent(siteEntity -> {
-            List<PageEntity> existingPages = pageRepository.findBySite(siteEntity);
-            if (!existingPages.isEmpty()) {
-                log.info("Удаление существующих записей страниц для сайта: {}", site.getUrl());
-                pageRepository.deleteAll(existingPages);
-            }
-        });
-        existingSite.ifPresent(siteRepository::delete);
 
         SiteEntity indexedSite = new SiteEntity();
         indexedSite.setUrl(site.getUrl());
@@ -168,6 +159,7 @@ public class SiteIndexingService {
 
         log.info("Статус индексации для сайта установлен: {}", site.getUrl());
     }
+
 
     public void stopIndexing() {
         stopRequested = true;

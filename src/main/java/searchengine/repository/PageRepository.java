@@ -11,7 +11,7 @@ import java.util.Optional;
 @Repository
 public interface PageRepository extends JpaRepository<PageEntity, Long> {
 
-    List<PageEntity> findBySite(SiteEntity site);
+//    List<PageEntity> findBySite(SiteEntity site);
 
     Optional<PageEntity> findBySiteAndPath(SiteEntity siteEntity, String path);
 }
