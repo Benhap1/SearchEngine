@@ -1,7 +1,5 @@
 package searchengine.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import io.lettuce.core.api.sync.RedisCommands;
 import lombok.extern.slf4j.Slf4j;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
@@ -24,6 +22,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+
 @Slf4j
 @Service
 public class SiteIndexingService {
@@ -43,12 +42,6 @@ public class SiteIndexingService {
     @Autowired
     private LemmaFinder lemmaFinder;
 
-    @Autowired
-    private RedisCommands<String, String> redisCommands;
-
-    @Autowired
-    private ObjectMapper objectMapper; // Внедряем ObjectMapper
-
     // Кэш проверки существования URL страниц
     private final ConcurrentHashMap<String, Boolean> pageUrlCache = new ConcurrentHashMap<>();
 
@@ -56,6 +49,7 @@ public class SiteIndexingService {
 
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
+
 
     @Transactional
     public void indexSites(List<Site> sites) {
@@ -76,11 +70,9 @@ public class SiteIndexingService {
 
             if (!stopRequested) {
                 mergeLemmas();
-                clearCache();
             } else {
                 log.info("Индексация была остановлена пользователем.");
             }
-
         } catch (InterruptedException e) {
             log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
@@ -89,6 +81,9 @@ public class SiteIndexingService {
                 log.warn("Принудительное завершение незавершенных задач в ForkJoinPool");
                 forkJoinPool.shutdownNow();
             }
+
+            // Всегда очищаем кэш после завершения индексации
+            clearCache();
         }
 
         log.info("Конец индексации сайтов: {}", sites);
@@ -100,11 +95,39 @@ public class SiteIndexingService {
     }
 
     private void indexSite(Site site) {
-
         if (stopRequested) return;
 
         log.info("Начало индексации сайта: {}", site.getUrl());
 
+        // Проверяем наличие записей в таблицах и удаляем их, если они существуют
+        if (indexRepository.count() > 0) {
+            log.info("Таблица indexx не пуста, удаляем данные");
+            indexRepository.deleteAllInBatch();
+        } else {
+            log.info("Таблица indexx пуста, удаление пропущено");
+        }
+
+        if (lemmaRepository.count() > 0) {
+            log.info("Таблица lemma не пуста, удаляем данные");
+            lemmaRepository.deleteAllInBatch();
+        } else {
+            log.info("Таблица lemma пуста, удаление пропущено");
+        }
+
+        if (pageRepository.count() > 0) {
+            log.info("Таблица page не пуста, удаляем данные");
+            pageRepository.deleteAllInBatch();
+        } else {
+            log.info("Таблица page пуста, удаление пропущено");
+        }
+
+        if (siteRepository.count() > 0) {
+            log.info("Таблица site не пуста, удаляем данные");
+            siteRepository.deleteAllInBatch();
+        } else {
+            log.info("Таблица site пуста, удаление пропущено");
+        }
+        // Обновляем статус индексации сайта
         updateSiteIndexingStatus(site);
 
         SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
@@ -112,11 +135,11 @@ public class SiteIndexingService {
 
         indexPages(site.getUrl(), indexedSite);
 
-
         updateSiteStatus(indexedSite);
 
         log.info("Завершение индексации сайта: {}", site.getUrl());
     }
+
 
     private void updateSiteIndexingStatus(Site site) {
         log.info("Установка статуса индексации для сайта: {}", site.getUrl());
@@ -201,10 +224,6 @@ public class SiteIndexingService {
     }
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
-//        if (stopRequested) {
-//            log.info("Индексация остановлена пользователем.");
-//            return null;
-//        }
         log.info("Начало создания записи страницы: {}", url);
 
         String path;
