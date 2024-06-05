@@ -1,10 +1,11 @@
 package searchengine.service;
 
+import lombok.RequiredArgsConstructor;
+import lombok.Synchronized;
 import lombok.extern.slf4j.Slf4j;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.select.Elements;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,37 +22,52 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+
 
 
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class SiteIndexingService {
 
-    @Autowired
-    private SiteRepository siteRepository;
+    private final SiteRepository siteRepository;
+    private final PageRepository pageRepository;
+    private final LemmaRepository lemmaRepository;
+    private final IndexRepository indexRepository;
+    private final LemmaFinder lemmaFinder;
 
-    @Autowired
-    private PageRepository pageRepository;
+    // Кэш проверки существования URL страниц с использованием Caffeine
+    private final Cache<String, Boolean> pageUrlCache = Caffeine.newBuilder()
+            .maximumSize(600) // Максимальное количество элементов в кэше
+            .expireAfterAccess(10, TimeUnit.MINUTES) // Время жизни элемента в кэше после последнего доступа
+            .build();
 
-    @Autowired
-    private LemmaRepository lemmaRepository;
+    // Кэш лемм с LRU-очисткой
+    private final Cache<String, LemmaEntity> lemmaCache = Caffeine.newBuilder()
+            .maximumSize(10000) // Размер кэша
+            .expireAfterAccess(10, TimeUnit.MINUTES) // Время жизни элемента в кэше после последнего доступа
+            .build();
 
-    @Autowired
-    private IndexRepository indexRepository;
-
-    @Autowired
-    private LemmaFinder lemmaFinder;
-
-    // Кэш проверки существования URL страниц
-    private final ConcurrentHashMap<String, Boolean> pageUrlCache = new ConcurrentHashMap<>();
+    // Кэш для индексов
+    private final Cache<String, List<IndexEntity>> indexCache = Caffeine.newBuilder()
+            .maximumSize(10000)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .build();
 
     private volatile boolean stopRequested = false;
 
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
 
+    @Value("${indexing-settings.batchSize}")
+    private int batchSize;
 
-    @Transactional
+
+
     public void indexSites(List<Site> sites) {
         log.info("Начало индексации сайтов: {}", sites);
 
@@ -86,12 +102,13 @@ public class SiteIndexingService {
         log.info("Конец индексации сайтов: {}", sites);
     }
 
+
     private void clearCache() {
-        pageUrlCache.clear();
+        pageUrlCache.invalidateAll();
         log.info("Кэш страниц очищен.");
     }
-
-    private void indexSite(Site site) {
+    @Transactional
+    protected void indexSite(Site site) {
         if (stopRequested) return;
 
         log.info("Начало индексации сайта: {}", site.getUrl());
@@ -108,11 +125,11 @@ public class SiteIndexingService {
 
         log.info("Завершение индексации сайта: {}", site.getUrl());
 
-        mergeLemmas();
+
     }
 
-
-    private void updateSiteIndexingStatus(Site site) {
+    @Transactional
+    protected void updateSiteIndexingStatus(Site site) {
         log.info("Установка статуса индексации для сайта: {}", site.getUrl());
 
         // Проверяем наличие записей в таблицах и удаляем их, если они существуют
@@ -168,6 +185,7 @@ public class SiteIndexingService {
             if (siteEntity.getStatus().equals(SiteStatus.INDEXING.name())) {
                 siteEntity.setStatus(SiteStatus.FAILED.name());
                 siteEntity.setStatusTime(LocalDateTime.now());
+                siteEntity.setLastError("Индексация остановлена пользователем");
                 siteRepository.save(siteEntity);
                 log.info("Статус сайта {} установлен в FAILED", siteEntity.getUrl());
             }
@@ -197,10 +215,11 @@ public class SiteIndexingService {
         log.info("Начало обработки страницы: {}", url);
         visitedUrls.putIfAbsent(url, true);
 
-        if (pageUrlCache.putIfAbsent(url, true) != null) {
+        if (pageUrlCache.getIfPresent(url) != null) {
             log.info("Страница уже была обработана: {}", url);
             return;
         }
+        pageUrlCache.put(url, true);
 
         PageEntity pageEntity = createPageEntity(document, url, siteEntity);
         if (pageEntity == null) {
@@ -324,7 +343,8 @@ public class SiteIndexingService {
         }
     }
 
-    private void updateSiteStatus(SiteEntity siteEntity) {
+    @Transactional
+    protected void updateSiteStatus(SiteEntity siteEntity) {
         if (stopRequested) {
             log.info("Индексация остановлена пользователем.");
             siteEntity.setStatus(SiteStatus.FAILED.name());
@@ -337,34 +357,41 @@ public class SiteIndexingService {
 
         try {
             siteRepository.save(siteEntity);
-            log.info("Завершение обновления статуса сайта: {}", siteEntity.getUrl());
+            log.info("Завершение полной индексации и лемматизации сайта: {}", siteEntity.getUrl());
         } catch (Exception e) {
             log.error("Ошибка при обновлении статуса сайта {}: {}", siteEntity.getUrl(), e.getMessage());
         }
     }
 
-    public void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
-        int batchSize = 5000;
+    @Synchronized
+    protected void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
+        log.info("Начало сохранения лемм и индексов для страницы: {}", pageEntity.getPath());
         List<LemmaEntity> lemmaEntities = new ArrayList<>();
         List<IndexEntity> indexEntities = new ArrayList<>();
 
-        int count = 0;
-        for (Map.Entry<String, Integer> entry : lemmas.entrySet()) {
-            LemmaEntity lemmaEntity = new LemmaEntity();
-            lemmaEntity.setLemma(entry.getKey());
-            lemmaEntity.setFrequency(1);
-            lemmaEntity.setSite(siteEntity);
+        AtomicInteger countLemmas = new AtomicInteger();
+
+        lemmas.forEach((lemma, frequency) -> {
+            LemmaEntity lemmaEntity = lemmaCache.get(lemma, key -> {
+                LemmaEntity newLemma = new LemmaEntity();
+                newLemma.setLemma(lemma);
+                newLemma.setSite(siteEntity);
+                newLemma.setFrequency(1);
+                return newLemma;
+            });
+
+            lemmaEntity.setFrequency(lemmaEntity.getFrequency() + frequency);
             lemmaEntities.add(lemmaEntity);
 
             IndexEntity indexEntity = new IndexEntity();
             indexEntity.setPage(pageEntity);
             indexEntity.setLemma(lemmaEntity);
-            indexEntity.setRank(entry.getValue().floatValue());
+            indexEntity.setRank(Float.valueOf(frequency));
             indexEntities.add(indexEntity);
 
-            count++;
+            countLemmas.getAndIncrement();
 
-            if (count % batchSize == 0) {
+            if (countLemmas.get() % batchSize == 0) {
                 // Сохранение лемм и индексов в базу данных
                 try {
                     lemmaRepository.saveAll(lemmaEntities);
@@ -373,11 +400,15 @@ public class SiteIndexingService {
                     log.error("Ошибка при сохранении лемм и индексов: {}", e.getMessage());
                 }
 
+                // Очистка кэша лемм и кэша индексов для следующего пакета
+                lemmaCache.invalidateAll();
+                indexCache.invalidateAll();
+
                 // Очистка списков для следующего пакета
                 lemmaEntities.clear();
                 indexEntities.clear();
             }
-        }
+        });
 
         // Сохранение оставшихся лемм и индексов, если есть
         if (!lemmaEntities.isEmpty()) {
@@ -386,73 +417,14 @@ public class SiteIndexingService {
                 indexRepository.saveAll(indexEntities);
             } catch (Exception e) {
                 log.error("Ошибка при сохранении лемм и индексов: {}", e.getMessage());
+            } finally {
+                // Очистка кэша лемм и кэша индексов после завершения операции
+                lemmaCache.invalidateAll();
+                indexCache.invalidateAll();
             }
         }
 
-    }
-
-    public void mergeLemmas() {
-        log.info("Начало объединения дублирующихся лемм.");
-
-        try {
-            // Получение всех лемм и индексов
-            List<LemmaEntity> allLemmas = lemmaRepository.findAll();
-            List<IndexEntity> allIndices = indexRepository.findAll();
-
-            // Подсчет частоты каждой леммы
-            Map<String, Integer> lemmaFrequencyMap = new HashMap<>();
-            for (LemmaEntity lemma : allLemmas) {
-                lemmaFrequencyMap.merge(lemma.getLemma(), lemma.getFrequency(), Integer::sum);
-            }
-
-            log.info("Количество уникальных лемм: {}", lemmaFrequencyMap.size());
-
-            // Создание отображения лемм к спискам связанных страниц
-            Map<String, List<PageEntity>> lemmaPagesMap = new HashMap<>();
-            for (IndexEntity index : allIndices) {
-                LemmaEntity lemma = index.getLemma();
-                PageEntity page = index.getPage();
-                lemmaPagesMap.computeIfAbsent(lemma.getLemma(), k -> new ArrayList<>()).add(page);
-            }
-
-            // Удаление всех записей из таблицы индексов
-            indexRepository.deleteAll();
-
-            // Получение site_id для всех лемм
-            Optional<LemmaEntity> firstLemma = allLemmas.stream().findFirst();
-            SiteEntity siteForLemmas = firstLemma.map(LemmaEntity::getSite).orElse(null);
-
-            // Удаление всех записей из таблицы лемм
-            lemmaRepository.deleteAll();
-
-            // Обновление частоты лемм и сохранение индексов
-            List<LemmaEntity> mergedLemmas = new ArrayList<>();
-            List<IndexEntity> mergedIndices = new ArrayList<>();
-            for (Map.Entry<String, Integer> entry : lemmaFrequencyMap.entrySet()) {
-                LemmaEntity lemmaEntity = new LemmaEntity();
-                lemmaEntity.setLemma(entry.getKey());
-                lemmaEntity.setFrequency(entry.getValue());
-                lemmaEntity.setSite(siteForLemmas); // Установка site_id для каждой леммы
-                mergedLemmas.add(lemmaEntity);
-
-                List<PageEntity> relatedPages = lemmaPagesMap.getOrDefault(entry.getKey(), new ArrayList<>());
-                for (PageEntity page : relatedPages) {
-                    IndexEntity indexEntity = new IndexEntity();
-                    indexEntity.setLemma(lemmaEntity);
-                    indexEntity.setPage(page);
-                    indexEntity.setRank(entry.getValue().floatValue()); // Обновление частоты в индексе
-                    mergedIndices.add(indexEntity);
-                }
-            }
-
-            // Сохранение обновленных лемм и индексов
-            lemmaRepository.saveAll(mergedLemmas);
-            indexRepository.saveAll(mergedIndices);
-
-            log.info("Завершено объединение лемм и обновление индексов.");
-        } catch (Exception e) {
-            log.error("Ошибка при объединении лемм и обновлении индексов: {}", e.getMessage());
-        }
+        log.info("Завершение сохранения лемм и индексов для страницы: {}", pageEntity.getPath());
     }
 
 
@@ -499,9 +471,16 @@ public class SiteIndexingService {
             int statusCode = Jsoup.connect(url).execute().statusCode();
             pageEntity.setCode(statusCode);
 
+            // Сохраняем или обновляем страницу
             pageRepository.save(pageEntity);
-            log.info("Страница {} успешно индексирована", url);
 
+            // Собираем леммы из содержимого страницы
+            Map<String, Integer> lemmas = lemmaFinder.collectLemmas(pageEntity.getContent());
+
+            // Сохраняем леммы и индексы
+            saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
+
+            log.info("Страница {} успешно индексирована", url);
         } catch (IOException e) {
             log.error("Ошибка при индексации страницы {}: {}", url, e.getMessage());
         }
