@@ -22,8 +22,6 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 
@@ -52,26 +50,17 @@ public class SiteIndexingService {
             .expireAfterAccess(10, TimeUnit.MINUTES) // Время жизни элемента в кэше после последнего доступа
             .build();
 
-    // Кэш для индексов
-    private final Cache<String, List<IndexEntity>> indexCache = Caffeine.newBuilder()
-            .maximumSize(10000)
-            .expireAfterWrite(10, TimeUnit.MINUTES)
-            .build();
-
     private volatile boolean stopRequested = false;
 
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
-
-    @Value("${indexing-settings.batchSize}")
-    private int batchSize;
-
 
 
     public void indexSites(List<Site> sites) {
         log.info("Начало индексации сайтов: {}", sites);
 
         stopRequested = false;
+
 
         ForkJoinPool forkJoinPool = new ForkJoinPool(parallelism);
         try {
@@ -94,10 +83,9 @@ public class SiteIndexingService {
                 log.warn("Принудительное завершение незавершенных задач в ForkJoinPool");
                 forkJoinPool.shutdownNow();
             }
-
-            // Всегда очищаем кэш после завершения индексации
-            clearCache();
         }
+        // Всегда очищаем кэш после завершения индексации
+        clearCache();
 
         log.info("Конец индексации сайтов: {}", sites);
     }
@@ -105,8 +93,11 @@ public class SiteIndexingService {
 
     private void clearCache() {
         pageUrlCache.invalidateAll();
-        log.info("Кэш страниц очищен.");
+        lemmaCache.invalidateAll();  // Добавить очистку кэша лемм
+        log.info("Кэш страниц и лемм очищен.");
     }
+
+
     @Transactional
     protected void indexSite(Site site) {
         if (stopRequested) return;
@@ -178,19 +169,7 @@ public class SiteIndexingService {
     }
 
 
-    public void stopIndexing() {
-        stopRequested = true;
 
-        siteRepository.findAll().forEach(siteEntity -> {
-            if (siteEntity.getStatus().equals(SiteStatus.INDEXING.name())) {
-                siteEntity.setStatus(SiteStatus.FAILED.name());
-                siteEntity.setStatusTime(LocalDateTime.now());
-                siteEntity.setLastError("Индексация остановлена пользователем");
-                siteRepository.save(siteEntity);
-                log.info("Статус сайта {} установлен в FAILED", siteEntity.getUrl());
-            }
-        });
-    }
 
     private void indexPages(String baseUrl, SiteEntity indexedSite) {
 
@@ -328,6 +307,58 @@ public class SiteIndexingService {
         log.info("Завершение извлечения ссылок и индексации страниц: {}", document.baseUri());
     }
 
+
+    public LemmaEntity getOrCreateLemma(String lemma, SiteEntity site) {
+        return lemmaCache.get(lemma, key -> {
+            LemmaEntity existingLemma = lemmaRepository.findByLemmaAndSite(key, site).orElse(null);
+            if (existingLemma != null) {
+                return existingLemma;
+            } else {
+                LemmaEntity newLemma = new LemmaEntity();
+                newLemma.setLemma(lemma);
+                newLemma.setSite(site);
+                newLemma.setFrequency(1);
+                return newLemma;
+            }
+
+        });
+    }
+
+    @Synchronized
+    public void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
+        if (stopRequested) return;
+        List<LemmaEntity> lemmaEntities = new ArrayList<>();
+        List<IndexEntity> indexEntities = new ArrayList<>();
+
+        lemmas.forEach((lemma, frequency) -> {
+            LemmaEntity lemmaEntity = getOrCreateLemma(lemma, siteEntity);
+            lemmaEntity.setFrequency(lemmaEntity.getFrequency() + frequency);
+            lemmaEntities.add(lemmaEntity);
+
+            IndexEntity indexEntity = new IndexEntity();
+            indexEntity.setPage(pageEntity);
+            indexEntity.setLemma(lemmaEntity);
+            indexEntity.setRank(Float.valueOf(frequency));
+            indexEntities.add(indexEntity);
+        });
+
+        lemmaRepository.saveAll(lemmaEntities);
+        indexRepository.saveAll(indexEntities);
+    }
+    public void stopIndexing() {
+        stopRequested = true;
+
+        siteRepository.findAll().forEach(siteEntity -> {
+            if (siteEntity.getStatus().equals(SiteStatus.INDEXING.name())) {
+                siteEntity.setStatus(SiteStatus.FAILED.name());
+                siteEntity.setStatusTime(LocalDateTime.now());
+                siteEntity.setLastError("Индексация остановлена пользователем");
+                siteRepository.save(siteEntity);
+                log.info("Статус сайта {} установлен в FAILED", siteEntity.getUrl());
+            }
+        });
+    }
+
     private boolean isInternalLink(String url, String baseUrl) {
         try {
             URL nextUrl = new URL(url);
@@ -363,69 +394,6 @@ public class SiteIndexingService {
         }
     }
 
-    @Synchronized
-    protected void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
-        log.info("Начало сохранения лемм и индексов для страницы: {}", pageEntity.getPath());
-        List<LemmaEntity> lemmaEntities = new ArrayList<>();
-        List<IndexEntity> indexEntities = new ArrayList<>();
-
-        AtomicInteger countLemmas = new AtomicInteger();
-
-        lemmas.forEach((lemma, frequency) -> {
-            LemmaEntity lemmaEntity = lemmaCache.get(lemma, key -> {
-                LemmaEntity newLemma = new LemmaEntity();
-                newLemma.setLemma(lemma);
-                newLemma.setSite(siteEntity);
-                newLemma.setFrequency(1);
-                return newLemma;
-            });
-
-            lemmaEntity.setFrequency(lemmaEntity.getFrequency() + frequency);
-            lemmaEntities.add(lemmaEntity);
-
-            IndexEntity indexEntity = new IndexEntity();
-            indexEntity.setPage(pageEntity);
-            indexEntity.setLemma(lemmaEntity);
-            indexEntity.setRank(Float.valueOf(frequency));
-            indexEntities.add(indexEntity);
-
-            countLemmas.getAndIncrement();
-
-            if (countLemmas.get() % batchSize == 0) {
-                // Сохранение лемм и индексов в базу данных
-                try {
-                    lemmaRepository.saveAll(lemmaEntities);
-                    indexRepository.saveAll(indexEntities);
-                } catch (Exception e) {
-                    log.error("Ошибка при сохранении лемм и индексов: {}", e.getMessage());
-                }
-
-                // Очистка кэша лемм и кэша индексов для следующего пакета
-                lemmaCache.invalidateAll();
-                indexCache.invalidateAll();
-
-                // Очистка списков для следующего пакета
-                lemmaEntities.clear();
-                indexEntities.clear();
-            }
-        });
-
-        // Сохранение оставшихся лемм и индексов, если есть
-        if (!lemmaEntities.isEmpty()) {
-            try {
-                lemmaRepository.saveAll(lemmaEntities);
-                indexRepository.saveAll(indexEntities);
-            } catch (Exception e) {
-                log.error("Ошибка при сохранении лемм и индексов: {}", e.getMessage());
-            } finally {
-                // Очистка кэша лемм и кэша индексов после завершения операции
-                lemmaCache.invalidateAll();
-                indexCache.invalidateAll();
-            }
-        }
-
-        log.info("Завершение сохранения лемм и индексов для страницы: {}", pageEntity.getPath());
-    }
 
 
     private void handleIndexingError(SiteEntity indexedSite, IOException e) {
