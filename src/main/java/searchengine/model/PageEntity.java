@@ -5,7 +5,9 @@ import lombok.Data;
 
 @Data
 @Entity
-@Table(name = "page")
+@Table(name = "page", indexes = {
+        @Index(name = "page_path_site_index", columnList = "path, site_id")
+})
 public class PageEntity {
 
     @Id

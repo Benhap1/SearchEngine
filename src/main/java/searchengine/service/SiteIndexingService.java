@@ -10,6 +10,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import searchengine.config.Site;
+import searchengine.config.SitesList;
+import searchengine.dto.search.SearchResultDto;
+import searchengine.dto.search.SearchResults;
 import searchengine.model.*;
 import searchengine.repository.IndexRepository;
 import searchengine.repository.LemmaRepository;
@@ -22,9 +25,9 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-
 
 
 @Slf4j
@@ -37,6 +40,7 @@ public class SiteIndexingService {
     private final LemmaRepository lemmaRepository;
     private final IndexRepository indexRepository;
     private final LemmaFinder lemmaFinder;
+    private final SitesList sitesList;
 
     // Кэш проверки существования URL страниц с использованием Caffeine
     private final Cache<String, Boolean> pageUrlCache = Caffeine.newBuilder()
@@ -52,11 +56,13 @@ public class SiteIndexingService {
 
     private volatile boolean stopRequested = false;
 
+
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
 
 
     public void indexSites(List<Site> sites) {
+
         log.info("Начало индексации сайтов: {}", sites);
 
         stopRequested = false;
@@ -100,8 +106,6 @@ public class SiteIndexingService {
 
     @Transactional
     protected void indexSite(Site site) {
-        if (stopRequested) return;
-
         log.info("Начало индексации сайта: {}", site.getUrl());
 
         // Обновляем статус индексации сайта
@@ -169,8 +173,6 @@ public class SiteIndexingService {
     }
 
 
-
-
     private void indexPages(String baseUrl, SiteEntity indexedSite) {
 
         if (stopRequested) return;
@@ -200,6 +202,11 @@ public class SiteIndexingService {
         }
         pageUrlCache.put(url, true);
 
+        if (isFileUrl(url)) {
+            log.info("Пропуск файла: {}", url);
+            return;
+        }
+
         PageEntity pageEntity = createPageEntity(document, url, siteEntity);
         if (pageEntity == null) {
             log.error("Не удалось создать запись для страницы: {}", url);
@@ -212,6 +219,12 @@ public class SiteIndexingService {
 
         log.info("Завершение обработки страницы: {}", url);
     }
+
+
+    private boolean isFileUrl(String url) {
+        return url.endsWith(".pdf") || url.endsWith(".png") || url.endsWith(".jpg");
+    }
+
 
     private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
         log.info("Начало создания записи страницы: {}", url);
@@ -257,6 +270,7 @@ public class SiteIndexingService {
 
         return null;
     }
+
 
     private void extractLinksAndIndexPages(Document document, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         if (stopRequested) return;
@@ -345,6 +359,7 @@ public class SiteIndexingService {
         lemmaRepository.saveAll(lemmaEntities);
         indexRepository.saveAll(indexEntities);
     }
+
     public void stopIndexing() {
         stopRequested = true;
 
@@ -352,7 +367,7 @@ public class SiteIndexingService {
             if (siteEntity.getStatus().equals(SiteStatus.INDEXING.name())) {
                 siteEntity.setStatus(SiteStatus.FAILED.name());
                 siteEntity.setStatusTime(LocalDateTime.now());
-                siteEntity.setLastError("Индексация остановлена пользователем");
+                siteEntity.setLastError("Indexing stopped by user");
                 siteRepository.save(siteEntity);
                 log.info("Статус сайта {} установлен в FAILED", siteEntity.getUrl());
             }
@@ -374,16 +389,20 @@ public class SiteIndexingService {
         }
     }
 
+
     @Transactional
     protected void updateSiteStatus(SiteEntity siteEntity) {
         if (stopRequested) {
             log.info("Индексация остановлена пользователем.");
             siteEntity.setStatus(SiteStatus.FAILED.name());
+            siteEntity.setStatusTime(LocalDateTime.now());
+            siteEntity.setLastError("Индексация прервана пользователем!");
             siteRepository.save(siteEntity);
         } else {
             log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
             siteEntity.setStatus(SiteStatus.INDEXED.name());
             siteEntity.setStatusTime(LocalDateTime.now());
+            siteEntity.setLastError(null);
         }
 
         try {
@@ -393,7 +412,6 @@ public class SiteIndexingService {
             log.error("Ошибка при обновлении статуса сайта {}: {}", siteEntity.getUrl(), e.getMessage());
         }
     }
-
 
 
     private void handleIndexingError(SiteEntity indexedSite, IOException e) {
@@ -453,4 +471,244 @@ public class SiteIndexingService {
             log.error("Ошибка при индексации страницы {}: {}", url, e.getMessage());
         }
     }
+
+
+    public SearchResults search(String query, String site, int offset, int limit) {
+        log.info("Выполнение поиска для запроса: '{}', сайт: '{}', смещение: {}, лимит: {}", query, site, offset, limit);
+        List<SearchResultDto> allResults = new ArrayList<>();
+
+        // Если site не указан или пуст, выполнить поиск по всем сайтам
+        if (site == null || site.isEmpty()) {
+            for (Site currentSite : sitesList.getSites()) {
+                List<SearchResultDto> siteResults = performSearch(query, currentSite.getUrl());
+                allResults.addAll(siteResults);
+            }
+        } else {
+            // Иначе выполнить поиск по указанному сайту
+            List<SearchResultDto> siteResults = performSearch(query, site);
+            allResults.addAll(siteResults);
+        }
+
+        allResults.sort(Comparator.comparingDouble(SearchResultDto::getRelevance).reversed());
+
+        // Пагинация
+        int startIndex = Math.min(offset, allResults.size());
+        int endIndex = Math.min(offset + limit, allResults.size());
+        List<SearchResultDto> paginatedResults = allResults.subList(startIndex, endIndex);
+
+        log.info("Завершение поиска для запроса: '{}', сайт: '{}', смещение: {}, лимит: {}", query, site, offset, limit);
+        return new SearchResults(true, allResults.size(), paginatedResults);
+    }
+
+
+
+
+    private List<String> sortLemmasByFrequency(Set<String> lemmas) {
+        // Сначала создадим карту для хранения частоты встречаемости лемм
+        Map<String, Integer> lemmaFrequencyMap = new HashMap<>();
+
+        // Заполняем карту частотами встречаемости для каждой леммы
+        for (String lemma : lemmas) {
+            int frequency = lemmaRepository.countByLemma(lemma);
+            lemmaFrequencyMap.put(lemma, frequency);
+        }
+
+        // Сортируем леммы по частоте встречаемости
+        return lemmaFrequencyMap.entrySet().stream()
+                .sorted(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+    private Set<String> filterFrequentLemmas(Set<String> lemmas, double maxAllowedFrequencyPercentage) {
+        Set<String> filteredLemmas = new HashSet<>();
+        int totalPageCount = (int) pageRepository.count();
+
+        for (String lemma : lemmas) {
+            int lemmaFrequency = lemmaRepository.countByLemma(lemma);
+            double frequencyPercentage = (double) lemmaFrequency / totalPageCount;
+            if (frequencyPercentage <= maxAllowedFrequencyPercentage) {
+                filteredLemmas.add(lemma);
+            }
+        }
+        return filteredLemmas;
+    }
+
+
+    private List<SearchResultDto> performSearch(String query, String site) {
+        Set<String> lemmas = lemmaFinder.getLemmaSet(query);
+        double maxAllowedFrequencyPercentage = 0.5;
+        Set<String> filteredLemmas = filterFrequentLemmas(lemmas, maxAllowedFrequencyPercentage);
+        List<String> sortedLemmas = sortLemmasByFrequency(filteredLemmas);
+
+        List<PageEntity> pages = findPagesByLemmas(sortedLemmas, site);
+        if (pages.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<SearchResultDto> searchResults = new ArrayList<>();
+        double maxRelevance = 0.0;
+
+        for (PageEntity page : pages) {
+            double relevance = calculateRelevance(page, sortedLemmas);
+            if (relevance > maxRelevance) {
+                maxRelevance = relevance;
+            }
+            searchResults.add(createSearchResult(page, relevance, query));
+        }
+
+        for (SearchResultDto result : searchResults) {
+            result.setRelevance(result.getRelevance() / maxRelevance);
+        }
+
+        // Сортировка результатов по значимости
+        searchResults.sort(Comparator.comparingDouble(SearchResultDto::getRelevance).reversed());
+
+        return searchResults;
+    }
+
+
+
+    private List<PageEntity> findPagesByLemmas(List<String> sortedLemmas, String site) {
+        return pageRepository.findPagesByLemmasAndSite(sortedLemmas, site, sortedLemmas.size());
+    }
+
+    private double calculateRelevance(PageEntity page, List<String> sortedLemmas) {
+        List<IndexEntity> indices = indexRepository.findByPageAndLemmas(page, sortedLemmas);
+        return indices.stream()
+                .mapToDouble(IndexEntity::getRank)
+                .sum();
+    }
+
+
+    private SearchResultDto createSearchResult(PageEntity page, double relevance, String query) {
+        SearchResultDto result = new SearchResultDto();
+        result.setSite(page.getSite().getUrl());
+        result.setSiteName(page.getSite().getName());
+        result.setUri(page.getPath());
+        result.setTitle(extractTitle(page.getContent()));
+        result.setSnippet(createSnippet(page.getContent(), query)); // Используем query
+        result.setRelevance(relevance);
+        System.out.println("Created SearchResultDto: " + result); // Добавляем вывод для отладки
+        return result;
+    }
+
+
+    private String extractTitle(String content) {
+        Document document = Jsoup.parse(content);
+        return document.title();
+    }
+
+
+    private String createSnippet(String content, String query) {
+        // Найти леммы запроса
+        Set<String> queryLemmas = lemmaFinder.getLemmaSet(query);
+
+        // Создание коллекции для связывания слов контента с их леммами
+        Map<String, String> wordToLemmaMap = new HashMap<>();
+        String[] words = content.split("\\s+");
+        for (String word : words) {
+            List<String> lemmas = lemmaFinder.getLemmaSet(word).stream().toList();
+            for (String lemma : lemmas) {
+                wordToLemmaMap.put(word.toLowerCase(), lemma);
+            }
+        }
+
+        // Разделить контент на предложения
+        String[] sentences = content.split("(?<=[.!?])\\s+");
+
+        // Инициализация переменных для хранения лучшего сниппета
+        String bestSnippet = "";
+        int maxMatchedWords = 0;
+        boolean snippetFound = false;
+
+        // Перебор предложений для поиска лучшего сниппета
+        for (String sentence : sentences) {
+            // Очистить от HTML тегов
+            String cleanSentence = Jsoup.parse(sentence).text();
+
+            // Найти леммы в предложении
+            Set<String> sentenceLemmas = lemmaFinder.getLemmaSet(cleanSentence);
+
+            // Подсчитать количество ключевых слов из запроса, найденных в текущем предложении
+            int matchedWordsCount = 0;
+            for (String lemma : queryLemmas) {
+                if (sentenceLemmas.contains(lemma)) {
+                    matchedWordsCount++;
+                }
+            }
+
+            // Если текущее предложение содержит больше ключевых слов, чем предыдущие, обновить лучший сниппет
+            if (matchedWordsCount > maxMatchedWords) {
+                // Найти первое ключевое слово в предложении
+                String[] sentenceWords = cleanSentence.split("\\s+");
+                int startIndex = -1;
+                for (int i = 0; i < sentenceWords.length; i++) {
+                    String word = sentenceWords[i];
+                    String lemma = wordToLemmaMap.getOrDefault(word.toLowerCase(), word);
+                    if (queryLemmas.contains(lemma)) {
+                        startIndex = i;
+                        break;
+                    }
+                }
+
+                // Формирование сниппета от первого найденного ключевого слова
+                if (startIndex != -1) {
+                    // Начальная и конечная позиции сниппета
+                    int snippetStart = Math.max(0, startIndex - 150);
+                    int snippetEnd = Math.min(sentenceWords.length - 1, startIndex + 150);
+
+                    StringBuilder snippetBuilder = new StringBuilder();
+                    int snippetLength = 0;
+                    boolean previousWordWasHighlighted = false;
+
+                    for (int i = snippetStart; i <= snippetEnd; i++) {
+                        String snippetWord = sentenceWords[i];
+                        String lemma = wordToLemmaMap.getOrDefault(snippetWord.toLowerCase(), snippetWord);
+
+                        boolean highlightWord = queryLemmas.contains(lemma);
+
+                        // Проверка текущей длины сниппета
+                        if (snippetLength + snippetWord.length() + 7 > 300) { // 7 - длина тегов <b> и </b>
+                            break; // Прервать если достигли максимальной длины сниппета
+                        }
+
+                        if (highlightWord) {
+                            if (!previousWordWasHighlighted) {
+                                snippetBuilder.append("<b>");
+                            }
+                            snippetBuilder.append(snippetWord).append(" ");
+                            previousWordWasHighlighted = true;
+                        } else {
+                            if (previousWordWasHighlighted) {
+                                snippetBuilder.append("</b>");
+                            }
+                            snippetBuilder.append(snippetWord).append(" ");
+                            previousWordWasHighlighted = false;
+                        }
+
+                        // Обновление текущей длины сниппета
+                        snippetLength += snippetWord.length() + 1; // +1 для пробела между словами
+                    }
+
+                    // Завершение открытого тега <b> в случае, если последнее слово было выделено
+                    if (previousWordWasHighlighted) {
+                        snippetBuilder.append("</b>");
+                    }
+
+                    bestSnippet = snippetBuilder.toString().trim();
+                    maxMatchedWords = matchedWordsCount;
+                    snippetFound = true;
+                }
+            }
+        }
+
+        // Если не удалось найти подходящий сниппет, вернуть первые 300 символов контента
+        if (!snippetFound) {
+            bestSnippet = content.substring(0, Math.min(content.length(), 300));
+        }
+
+        return bestSnippet; // Вернуть сформированный сниппет
+    }
 }
+

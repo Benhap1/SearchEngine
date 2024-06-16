@@ -1,0 +1,27 @@
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                   http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.1.xsd">
+
+    <changeSet id="add-index-to-page" author="ben4in">
+        <createIndex tableName="page" indexName="page_path_site_index" unique="false">
+            <column name="path"/>
+            <column name="site_id"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="add-index-to-lemma" author="ben4in">
+        <createIndex tableName="lemma" indexName="lemma_lemma_site_index" unique="false">
+            <column name="lemma"/>
+            <column name="site_id"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="add-index-to-indexx" author="ben4in">
+        <createIndex tableName="indexx" indexName="indexx_lemma_id_page_id_index" unique="false">
+            <column name="lemma_id"/>
+            <column name="page_id"/>
+        </createIndex>
+    </changeSet>
+
+</databaseChangeLog>

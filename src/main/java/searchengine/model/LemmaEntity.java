@@ -5,7 +5,9 @@ import lombok.Data;
 
 @Data
 @Entity
-@Table(name = "lemma")
+@Table(name = "lemma", indexes = {
+        @Index(name = "lemma_lemma_site_index", columnList = "lemma, site_id")
+})
 public class LemmaEntity {
 
     @Id

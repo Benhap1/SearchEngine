@@ -11,4 +11,5 @@
     <include file="db/changelog/003-create-table-lemma.xml"/>
     <include file="/db/changelog/004-create-table-indexx.xml"/>
     <include file="db/changelog/005-create-foreign-keys.xml"/>
+    <include file="db/changelog/006-create-indexes.xml"/>
 </databaseChangeLog>
