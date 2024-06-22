@@ -1,9 +1,9 @@
 indexing-settings:
   sites:
-    - url: https://www.itdeti.ru
-      name: itdeti.ru
     - url: https://www.sendel.ru
       name: sendel.ru
+    - url: https://www.itdeti.ru
+      name: itdeti.ru
   fork-join-pool:
     parallelism: 20
 

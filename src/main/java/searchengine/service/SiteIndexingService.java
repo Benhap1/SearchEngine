@@ -28,7 +28,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-
+import searchengine.util.GlobalErrorsHandler;
 
 @Slf4j
 @Service
@@ -41,32 +41,67 @@ public class SiteIndexingService {
     private final IndexRepository indexRepository;
     private final LemmaFinder lemmaFinder;
     private final SitesList sitesList;
+    private final GlobalErrorsHandler globalErrorsHandler;
 
-    // Кэш проверки существования URL страниц с использованием Caffeine
-    private final Cache<String, Boolean> pageUrlCache = Caffeine.newBuilder()
+    public final Cache<String, Boolean> pageUrlCache = Caffeine.newBuilder()
             .maximumSize(600) // Максимальное количество элементов в кэше
-            .expireAfterAccess(10, TimeUnit.MINUTES) // Время жизни элемента в кэше после последнего доступа
+            .expireAfterAccess(10, TimeUnit.MINUTES)
             .build();
 
-    // Кэш лемм с LRU-очисткой
     private final Cache<String, LemmaEntity> lemmaCache = Caffeine.newBuilder()
             .maximumSize(10000) // Размер кэша
-            .expireAfterAccess(10, TimeUnit.MINUTES) // Время жизни элемента в кэше после последнего доступа
+            .expireAfterAccess(10, TimeUnit.MINUTES)
             .build();
 
     private volatile boolean stopRequested = false;
-
+    private boolean indexingInProgress = false;
+    private final Object lock = new Object();
 
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
 
+    public boolean startIndexing(List<Site> sites) {
+        synchronized (lock) {
+            if (indexingInProgress) {
+                return false;
+            }
+            indexingInProgress = true;
+        }
+
+        new Thread(() -> {
+            try {
+                indexSites(sites);
+            } finally {
+                synchronized (lock) {
+                    indexingInProgress = false;
+                }
+            }
+        }).start();
+
+        return true;
+    }
+
+    public boolean stopIndex() {
+        synchronized (lock) {
+            if (!indexingInProgress) {
+                return false;
+            }
+            stopRequested = true;
+            indexingInProgress = false;
+        }
+        return true;
+    }
+
 
     public void indexSites(List<Site> sites) {
-
         log.info("Начало индексации сайтов: {}", sites);
 
-        stopRequested = false;
+        List<String> clearedErrors = globalErrorsHandler.getAllErrorsAndClear();
+        if (!clearedErrors.isEmpty()) {
+            log.info("Ошибки, очищенные перед началом индексации: {}", clearedErrors);
+        }
 
+        stopRequested = false;
 
         ForkJoinPool forkJoinPool = new ForkJoinPool(parallelism);
         try {
@@ -76,21 +111,33 @@ public class SiteIndexingService {
             boolean terminated = forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
 
             if (!terminated) {
+                globalErrorsHandler.addError("ForkJoinPool не завершился в указанный срок");
                 log.warn("ForkJoinPool не завершился в указанный срок");
             }
             if (stopRequested) {
+                globalErrorsHandler.addError("Индексация была остановлена пользователем.");
                 log.info("Индексация была остановлена пользователем.");
             }
         } catch (InterruptedException e) {
+            globalErrorsHandler.addError("Ошибка при ожидании завершения индексации сайтов: " + e.getMessage());
             log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
         } finally {
             if (!forkJoinPool.isTerminated()) {
+                globalErrorsHandler.addError("Принудительное завершение незавершенных задач в ForkJoinPool");
                 log.warn("Принудительное завершение незавершенных задач в ForkJoinPool");
                 forkJoinPool.shutdownNow();
             }
+            synchronized (lock) {
+                indexingInProgress = false;
+            }
         }
-        // Всегда очищаем кэш после завершения индексации
+
+        List<String> errorsAfterIndexing = globalErrorsHandler.getErrors();
+        if (!errorsAfterIndexing.isEmpty()) {
+            log.info("Ошибки, возникшие во время индексации: {}", errorsAfterIndexing);
+        }
+
         clearCache();
 
         log.info("Конец индексации сайтов: {}", sites);
@@ -107,27 +154,26 @@ public class SiteIndexingService {
     @Transactional
     protected void indexSite(Site site) {
         log.info("Начало индексации сайта: {}", site.getUrl());
-
-        // Обновляем статус индексации сайта
+        try {
         updateSiteIndexingStatus(site);
-
         SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
                 .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
-
         indexPages(site.getUrl(), indexedSite);
-
         updateSiteStatus(indexedSite);
+        } catch (Exception e) {
+            String errorMessage = "Ошибка при индексации сайта " + site.getUrl() + ": " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage, e);
+        }
 
         log.info("Завершение индексации сайта: {}", site.getUrl());
-
-
     }
+
 
     @Transactional
     protected void updateSiteIndexingStatus(Site site) {
         log.info("Установка статуса индексации для сайта: {}", site.getUrl());
-
-        // Проверяем наличие записей в таблицах и удаляем их, если они существуют
+        try {
         if (indexRepository.count() > 0) {
             log.info("Таблица indexx не пуста, удаляем данные");
             indexRepository.deleteAllInBatch();
@@ -170,13 +216,34 @@ public class SiteIndexingService {
         }
 
         log.info("Статус индексации для сайта установлен: {}", site.getUrl());
+        } catch (Exception e) {
+            String errorMessage = "Ошибка при установке статуса индексации для сайта " + site.getUrl() + ": " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage, e);
+        }
+    }
+
+
+    private String normalizeUrl(String url) {
+        try {
+            URL uri = new URL(url);
+            String path = uri.getPath().replaceAll("/{2,}", "/").replaceAll("/$", "");
+            if (path.isEmpty()) {
+                path = "/";
+            }
+            return new URL(uri.getProtocol(), uri.getHost(), path).toString().toLowerCase();
+        } catch (MalformedURLException e) {
+            String errorMessage = "Ошибка при нормализации URL: " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage);
+
+            return url.toLowerCase().replaceAll("/{2,}", "/").replaceAll("/$", ""); // возвращаем нормализованный URL даже при ошибке
+        }
     }
 
 
     private void indexPages(String baseUrl, SiteEntity indexedSite) {
-
         if (stopRequested) return;
-
         log.info("Начало индексации страниц сайта: {}", baseUrl);
         try {
             Document document = Jsoup.connect(baseUrl).get();
@@ -185,31 +252,36 @@ public class SiteIndexingService {
             ConcurrentHashMap<String, Boolean> visitedUrls = new ConcurrentHashMap<>();
             visitPage(document, baseUri, indexedSite, visitedUrls);
         } catch (IOException e) {
-            handleIndexingError(indexedSite, e);
+            String errorMessage = "Ошибка при индексации страниц сайта " + baseUrl + ": " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage, e);
         } finally {
             log.info("Конец индексации страниц сайта: {}", baseUrl);
         }
     }
 
-    private void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
+
+    public void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         if (stopRequested) return;
-        log.info("Начало обработки страницы: {}", url);
-        visitedUrls.putIfAbsent(url, true);
 
-        if (pageUrlCache.getIfPresent(url) != null) {
-            log.info("Страница уже была обработана: {}", url);
+        String normalizedUrl = normalizeUrl(url);
+        log.info("Начало обработки страницы: {}", normalizedUrl);
+        visitedUrls.putIfAbsent(normalizedUrl, true);
+
+        if (pageUrlCache.getIfPresent(normalizedUrl) != null) {
+            log.info("Страница уже была обработана: {}", normalizedUrl);
             return;
         }
-        pageUrlCache.put(url, true);
+        pageUrlCache.put(normalizedUrl, true);
 
-        if (isFileUrl(url)) {
-            log.info("Пропуск файла: {}", url);
+        if (isFileUrl(normalizedUrl)) {
+            log.info("Пропуск файла: {}", normalizedUrl);
             return;
         }
 
-        PageEntity pageEntity = createPageEntity(document, url, siteEntity);
+        PageEntity pageEntity = createPageEntity(document, normalizedUrl, siteEntity);
         if (pageEntity == null) {
-            log.error("Не удалось создать запись для страницы: {}", url);
+            log.error("Не удалось создать запись для страницы: {}", normalizedUrl);
             return;
         }
 
@@ -217,8 +289,10 @@ public class SiteIndexingService {
         saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
         extractLinksAndIndexPages(document, siteEntity, visitedUrls);
 
-        log.info("Завершение обработки страницы: {}", url);
+        log.info("Завершение обработки страницы: {}", normalizedUrl);
     }
+
+
 
 
     private boolean isFileUrl(String url) {
@@ -232,40 +306,54 @@ public class SiteIndexingService {
         String path;
         try {
             URL parsedUrl = new URL(url);
-            path = parsedUrl.getPath();
+            path = parsedUrl.getPath().replaceAll("/{2,}", "/").replaceAll("/$", "");
+
+            if (path.isEmpty()) {
+                path = "/";
+            }
         } catch (MalformedURLException e) {
-            log.error("Ошибка при разборе URL: {}", e.getMessage());
+            String errorMessage = "Ошибка при разборе URL " + url + ": " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage);
             return null;
         }
 
-        if (path == null || path.isEmpty()) {
-            log.error("Не удалось извлечь путь страницы из URL: {}", url);
-            return null;
-        }
-
-        Optional<PageEntity> existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
-        if (existingPage.isPresent()) {
-            log.info("Запись для страницы уже существует: {}", url);
-            return existingPage.get();
-        }
-
-        PageEntity pageEntity = new PageEntity();
-        pageEntity.setSite(siteEntity);
-        pageEntity.setPath(path);
-
+        Optional<PageEntity> existingPage;
         try {
-            int statusCode = Jsoup.connect(url).execute().statusCode();
-            pageEntity.setCode(statusCode);
-            pageEntity.setContent(document.outerHtml());
-            pageRepository.save(pageEntity);
-            log.info("Запись страницы успешно сохранена: {}", url);
-            return pageEntity;
-        } catch (IOException e) {
-            log.error("Ошибка при получении статуса страницы {}: {}", url, e.getMessage());
+            existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
+            if (existingPage.isPresent()) {
+                log.info("Запись для страницы уже существует: {}", url);
+                return existingPage.get();
+            }
+
+            PageEntity pageEntity = new PageEntity();
+            pageEntity.setSite(siteEntity);
+            pageEntity.setPath(path);
+
+            int statusCode;
+            try {
+                statusCode = Jsoup.connect(url).execute().statusCode();
+                pageEntity.setCode(statusCode);
+                pageEntity.setContent(document.outerHtml());
+                pageRepository.save(pageEntity);
+                log.info("Запись страницы успешно сохранена: {}", url);
+                return pageEntity;
+            } catch (IOException e) {
+                String errorMessage = "Ошибка при получении статуса страницы " + url + ": " + e.getMessage();
+                globalErrorsHandler.addError(errorMessage);
+                log.error(errorMessage);
+            } catch (Exception e) {
+                String errorMessage = "Ошибка при сохранении содержимого страницы " + url + ": " + e.getMessage();
+                globalErrorsHandler.addError(errorMessage);
+                log.error(errorMessage);
+            } finally {
+                log.info("Завершение создания записи страницы: {}", url);
+            }
+
         } catch (Exception e) {
-            log.error("Ошибка при сохранении содержимого страницы {}: {}", url, e.getMessage());
-        } finally {
-            log.info("Завершение создания записи страницы: {}", url);
+            String errorMessage = "Ошибка при поиске записи страницы для сайта " + siteEntity.getUrl() + ": " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage);
         }
 
         return null;
@@ -281,21 +369,24 @@ public class SiteIndexingService {
         try {
             links.forEach(link -> {
                 String nextUrl = link.absUrl("href");
-                if (visitedUrls.putIfAbsent(nextUrl, true) == null && isInternalLink(nextUrl, siteEntity.getUrl())) {
+                String normalizedNextUrl = normalizeUrl(nextUrl);
+                if (visitedUrls.putIfAbsent(normalizedNextUrl, true) == null && isInternalLink(normalizedNextUrl, siteEntity.getUrl())) {
                     forkJoinPool.submit(() -> {
                         if (stopRequested) {
                             log.info("Индексация остановлена пользователем.");
                             return;
                         }
                         try {
-                            Document nextDocument = Jsoup.connect(nextUrl).get();
+                            Document nextDocument = Jsoup.connect(normalizedNextUrl).get();
                             if (stopRequested) {
                                 log.info("Индексация остановлена пользователем.");
                                 return;
                             }
-                            visitPage(nextDocument, nextUrl, siteEntity, visitedUrls);
+                            visitPage(nextDocument, normalizedNextUrl, siteEntity, visitedUrls);
                         } catch (IOException e) {
-                            log.error("Ошибка при получении страницы {}: {}", nextUrl, e.getMessage());
+                            String errorMessage = "Ошибка при получении страницы " + normalizedNextUrl + ": " + e.getMessage();
+                            globalErrorsHandler.addError(errorMessage);
+                            log.error(errorMessage);
                         }
                     });
                 }
@@ -309,7 +400,9 @@ public class SiteIndexingService {
             }
 
         } catch (InterruptedException e) {
-            log.error("Ошибка при ожидании завершения индексации страниц: {}", e.getMessage());
+            String errorMessage = "Ошибка при ожидании завершения индексации страниц: " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage);
             Thread.currentThread().interrupt();
         } finally {
             if (!forkJoinPool.isTerminated()) {
@@ -322,7 +415,8 @@ public class SiteIndexingService {
     }
 
 
-    public LemmaEntity getOrCreateLemma(String lemma, SiteEntity site) {
+
+    private LemmaEntity getOrCreateLemma(String lemma, SiteEntity site) {  //изменил паблик на прайвет)
         return lemmaCache.get(lemma, key -> {
             LemmaEntity existingLemma = lemmaRepository.findByLemmaAndSite(key, site).orElse(null);
             if (existingLemma != null) {
@@ -338,8 +432,9 @@ public class SiteIndexingService {
         });
     }
 
+
     @Synchronized
-    public void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) {
+    private void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) { //изменил паблик на прайвет
         if (stopRequested) return;
         List<LemmaEntity> lemmaEntities = new ArrayList<>();
         List<IndexEntity> indexEntities = new ArrayList<>();
@@ -360,34 +455,27 @@ public class SiteIndexingService {
         indexRepository.saveAll(indexEntities);
     }
 
-    public void stopIndexing() {
-        stopRequested = true;
-
-        siteRepository.findAll().forEach(siteEntity -> {
-            if (siteEntity.getStatus().equals(SiteStatus.INDEXING.name())) {
-                siteEntity.setStatus(SiteStatus.FAILED.name());
-                siteEntity.setStatusTime(LocalDateTime.now());
-                siteEntity.setLastError("Indexing stopped by user");
-                siteRepository.save(siteEntity);
-                log.info("Статус сайта {} установлен в FAILED", siteEntity.getUrl());
-            }
-        });
-    }
 
     private boolean isInternalLink(String url, String baseUrl) {
+        String normalizedUrl = normalizeUrl(url);
+        String normalizedBaseUrl = normalizeUrl(baseUrl);
+
         try {
-            URL nextUrl = new URL(url);
-            URL base = new URL(baseUrl);
+            URL nextUrl = new URL(normalizedUrl);
+            URL base = new URL(normalizedBaseUrl);
 
             String nextHost = nextUrl.getHost().replaceAll("^(http://|https://|www\\.)", "");
             String baseHost = base.getHost().replaceAll("^(http://|https://|www\\.)", "");
 
             return nextHost.contains(baseHost);
         } catch (MalformedURLException e) {
-            log.error("Ошибка при разборе URL: {}", e.getMessage());
+            String errorMessage = "Ошибка при разборе URL: " + e.getMessage();
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage);
             return false;
         }
     }
+
 
 
     @Transactional
@@ -397,7 +485,6 @@ public class SiteIndexingService {
             siteEntity.setStatus(SiteStatus.FAILED.name());
             siteEntity.setStatusTime(LocalDateTime.now());
             siteEntity.setLastError("Индексация прервана пользователем!");
-            siteRepository.save(siteEntity);
         } else {
             log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
             siteEntity.setStatus(SiteStatus.INDEXED.name());
@@ -409,23 +496,12 @@ public class SiteIndexingService {
             siteRepository.save(siteEntity);
             log.info("Завершение полной индексации и лемматизации сайта: {}", siteEntity.getUrl());
         } catch (Exception e) {
-            log.error("Ошибка при обновлении статуса сайта {}: {}", siteEntity.getUrl(), e.getMessage());
+            String errorMessage = String.format("Ошибка при обновлении статуса сайта %s: %s", siteEntity.getUrl(), e.getMessage());
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage);
         }
     }
 
-
-    private void handleIndexingError(SiteEntity indexedSite, IOException e) {
-        String errorMessage = "Ошибка при индексации сайта " + indexedSite.getUrl() + ": " + e.getMessage();
-        log.error(errorMessage, e);
-        indexedSite.setStatus(SiteStatus.FAILED.name());
-        indexedSite.setLastError("Ошибка при попытке получения содержимого сайта: " + e.getMessage());
-        try {
-            siteRepository.save(indexedSite);
-        } catch (Exception ex) {
-            String saveError = "Ошибка при сохранении статуса ошибки индексации сайта " + indexedSite.getUrl() + ": " + ex.getMessage();
-            log.error(saveError, ex);
-        }
-    }
 
     public boolean indexPage(String url) throws MalformedURLException {
         URL parsedUrl = new URL(url);
@@ -442,6 +518,7 @@ public class SiteIndexingService {
         return true;
     }
 
+
     private void indexPageEntity(SiteEntity siteEntity, String url) {
         try {
             Document document = Jsoup.connect(url).get();
@@ -457,41 +534,38 @@ public class SiteIndexingService {
             int statusCode = Jsoup.connect(url).execute().statusCode();
             pageEntity.setCode(statusCode);
 
-            // Сохраняем или обновляем страницу
             pageRepository.save(pageEntity);
 
-            // Собираем леммы из содержимого страницы
             Map<String, Integer> lemmas = lemmaFinder.collectLemmas(pageEntity.getContent());
 
-            // Сохраняем леммы и индексы
             saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
 
             log.info("Страница {} успешно индексирована", url);
         } catch (IOException e) {
-            log.error("Ошибка при индексации страницы {}: {}", url, e.getMessage());
+            String errorMessage = String.format("Ошибка при индексации страницы %s: %s", url, e.getMessage());
+            globalErrorsHandler.addError(errorMessage);
+            log.error(errorMessage);
         }
     }
+
 
 
     public SearchResults search(String query, String site, int offset, int limit) {
         log.info("Выполнение поиска для запроса: '{}', сайт: '{}', смещение: {}, лимит: {}", query, site, offset, limit);
         List<SearchResultDto> allResults = new ArrayList<>();
 
-        // Если site не указан или пуст, выполнить поиск по всем сайтам
         if (site == null || site.isEmpty()) {
             for (Site currentSite : sitesList.getSites()) {
                 List<SearchResultDto> siteResults = performSearch(query, currentSite.getUrl());
                 allResults.addAll(siteResults);
             }
         } else {
-            // Иначе выполнить поиск по указанному сайту
             List<SearchResultDto> siteResults = performSearch(query, site);
             allResults.addAll(siteResults);
         }
 
         allResults.sort(Comparator.comparingDouble(SearchResultDto::getRelevance).reversed());
 
-        // Пагинация
         int startIndex = Math.min(offset, allResults.size());
         int endIndex = Math.min(offset + limit, allResults.size());
         List<SearchResultDto> paginatedResults = allResults.subList(startIndex, endIndex);
@@ -501,19 +575,45 @@ public class SiteIndexingService {
     }
 
 
+    private List<SearchResultDto> performSearch(String query, String site) {
+        Set<String> lemmas = lemmaFinder.getLemmaSet(query);
+        double maxAllowedFrequencyPercentage = 1.0;
+        Set<String> filteredLemmas = filterFrequentLemmas(lemmas, maxAllowedFrequencyPercentage);
+        List<String> sortedLemmas = sortLemmasByFrequency(filteredLemmas);
+
+        List<PageEntity> pages = findPagesByLemmas(sortedLemmas, site);
+        if (pages.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<SearchResultDto> searchResults = new ArrayList<>();
+        double maxRelevance = 0.0;
+
+        for (PageEntity page : pages) {
+            double relevance = calculateRelevance(page, sortedLemmas);
+            if (relevance > maxRelevance) {
+                maxRelevance = relevance;
+            }
+            searchResults.add(createSearchResult(page, relevance, sortedLemmas));
+        }
+
+        for (SearchResultDto result : searchResults) {
+            result.setRelevance(result.getRelevance() / maxRelevance);
+        }
+
+        searchResults.sort(Comparator.comparingDouble(SearchResultDto::getRelevance).reversed());
+
+        return searchResults;
+    }
 
 
     private List<String> sortLemmasByFrequency(Set<String> lemmas) {
-        // Сначала создадим карту для хранения частоты встречаемости лемм
         Map<String, Integer> lemmaFrequencyMap = new HashMap<>();
-
-        // Заполняем карту частотами встречаемости для каждой леммы
         for (String lemma : lemmas) {
             int frequency = lemmaRepository.countByLemma(lemma);
             lemmaFrequencyMap.put(lemma, frequency);
         }
 
-        // Сортируем леммы по частоте встречаемости
         return lemmaFrequencyMap.entrySet().stream()
                 .sorted(Map.Entry.comparingByValue())
                 .map(Map.Entry::getKey)
@@ -535,40 +635,6 @@ public class SiteIndexingService {
     }
 
 
-    private List<SearchResultDto> performSearch(String query, String site) {
-        Set<String> lemmas = lemmaFinder.getLemmaSet(query);
-        double maxAllowedFrequencyPercentage = 0.5;
-        Set<String> filteredLemmas = filterFrequentLemmas(lemmas, maxAllowedFrequencyPercentage);
-        List<String> sortedLemmas = sortLemmasByFrequency(filteredLemmas);
-
-        List<PageEntity> pages = findPagesByLemmas(sortedLemmas, site);
-        if (pages.isEmpty()) {
-            return Collections.emptyList();
-        }
-
-        List<SearchResultDto> searchResults = new ArrayList<>();
-        double maxRelevance = 0.0;
-
-        for (PageEntity page : pages) {
-            double relevance = calculateRelevance(page, sortedLemmas);
-            if (relevance > maxRelevance) {
-                maxRelevance = relevance;
-            }
-            searchResults.add(createSearchResult(page, relevance, query));
-        }
-
-        for (SearchResultDto result : searchResults) {
-            result.setRelevance(result.getRelevance() / maxRelevance);
-        }
-
-        // Сортировка результатов по значимости
-        searchResults.sort(Comparator.comparingDouble(SearchResultDto::getRelevance).reversed());
-
-        return searchResults;
-    }
-
-
-
     private List<PageEntity> findPagesByLemmas(List<String> sortedLemmas, String site) {
         return pageRepository.findPagesByLemmasAndSite(sortedLemmas, site, sortedLemmas.size());
     }
@@ -581,13 +647,13 @@ public class SiteIndexingService {
     }
 
 
-    private SearchResultDto createSearchResult(PageEntity page, double relevance, String query) {
+    private SearchResultDto createSearchResult(PageEntity page, double relevance, List<String> sortedLemmas) {
         SearchResultDto result = new SearchResultDto();
         result.setSite(page.getSite().getUrl());
         result.setSiteName(page.getSite().getName());
         result.setUri(page.getPath());
         result.setTitle(extractTitle(page.getContent()));
-        result.setSnippet(createSnippet(page.getContent(), query)); // Используем query
+        result.setSnippet(createSnippet(page.getContent(), sortedLemmas)); // Используем query
         result.setRelevance(relevance);
         System.out.println("Created SearchResultDto: " + result); // Добавляем вывод для отладки
         return result;
@@ -600,115 +666,59 @@ public class SiteIndexingService {
     }
 
 
-    private String createSnippet(String content, String query) {
-        // Найти леммы запроса
-        Set<String> queryLemmas = lemmaFinder.getLemmaSet(query);
+    private String createSnippet(String content, List<String> sortedLemmas) {
+        String cleanContent = Jsoup.parse(content).text();
+        cleanContent = cleanContent.replaceAll("[^\\p{IsCyrillic}\\s]", " ");
+        String bestSnippet = "";
+        for (String lemma : sortedLemmas) {
+            int keywordIndex = cleanContent.indexOf(lemma);
+            if (keywordIndex != -1) {
+                int snippetStart = Math.max(0, keywordIndex - 150);
+                int snippetEnd = Math.min(cleanContent.length(), keywordIndex + lemma.length() + 150);
+                bestSnippet = cleanContent.substring(snippetStart, snippetEnd);
+                bestSnippet = highlightKeywords(bestSnippet, sortedLemmas);
 
-        // Создание коллекции для связывания слов контента с их леммами
-        Map<String, String> wordToLemmaMap = new HashMap<>();
-        String[] words = content.split("\\s+");
+                return bestSnippet;
+            }
+        }
+
+        if (cleanContent.length() > 300) {
+            bestSnippet = cleanContent.substring(0, 300);
+        }
+
+        bestSnippet = highlightKeywords(bestSnippet, sortedLemmas);
+
+        return bestSnippet;
+    }
+
+    private String highlightKeywords(String snippet, List<String> sortedLemmas) {
+        StringBuilder snippetBuilder = new StringBuilder();
+        String[] words = snippet.split("\\s+");
+        boolean previousWordWasHighlighted = false;
+
         for (String word : words) {
             List<String> lemmas = lemmaFinder.getLemmaSet(word).stream().toList();
-            for (String lemma : lemmas) {
-                wordToLemmaMap.put(word.toLowerCase(), lemma);
+            String lemma = lemmas.isEmpty() ? word : lemmas.get(0); // Use first lemma if available
+            boolean highlightWord = sortedLemmas.contains(lemma);
+
+            if (highlightWord) {
+                if (!previousWordWasHighlighted) {
+                    snippetBuilder.append("<b>");
+                }
+                snippetBuilder.append(word).append(" ");
+                previousWordWasHighlighted = true;
+            } else {
+                if (previousWordWasHighlighted) {
+                    snippetBuilder.append("</b>");
+                }
+                snippetBuilder.append(word).append(" ");
+                previousWordWasHighlighted = false;
             }
         }
-
-        // Разделить контент на предложения
-        String[] sentences = content.split("(?<=[.!?])\\s+");
-
-        // Инициализация переменных для хранения лучшего сниппета
-        String bestSnippet = "";
-        int maxMatchedWords = 0;
-        boolean snippetFound = false;
-
-        // Перебор предложений для поиска лучшего сниппета
-        for (String sentence : sentences) {
-            // Очистить от HTML тегов
-            String cleanSentence = Jsoup.parse(sentence).text();
-
-            // Найти леммы в предложении
-            Set<String> sentenceLemmas = lemmaFinder.getLemmaSet(cleanSentence);
-
-            // Подсчитать количество ключевых слов из запроса, найденных в текущем предложении
-            int matchedWordsCount = 0;
-            for (String lemma : queryLemmas) {
-                if (sentenceLemmas.contains(lemma)) {
-                    matchedWordsCount++;
-                }
-            }
-
-            // Если текущее предложение содержит больше ключевых слов, чем предыдущие, обновить лучший сниппет
-            if (matchedWordsCount > maxMatchedWords) {
-                // Найти первое ключевое слово в предложении
-                String[] sentenceWords = cleanSentence.split("\\s+");
-                int startIndex = -1;
-                for (int i = 0; i < sentenceWords.length; i++) {
-                    String word = sentenceWords[i];
-                    String lemma = wordToLemmaMap.getOrDefault(word.toLowerCase(), word);
-                    if (queryLemmas.contains(lemma)) {
-                        startIndex = i;
-                        break;
-                    }
-                }
-
-                // Формирование сниппета от первого найденного ключевого слова
-                if (startIndex != -1) {
-                    // Начальная и конечная позиции сниппета
-                    int snippetStart = Math.max(0, startIndex - 150);
-                    int snippetEnd = Math.min(sentenceWords.length - 1, startIndex + 150);
-
-                    StringBuilder snippetBuilder = new StringBuilder();
-                    int snippetLength = 0;
-                    boolean previousWordWasHighlighted = false;
-
-                    for (int i = snippetStart; i <= snippetEnd; i++) {
-                        String snippetWord = sentenceWords[i];
-                        String lemma = wordToLemmaMap.getOrDefault(snippetWord.toLowerCase(), snippetWord);
-
-                        boolean highlightWord = queryLemmas.contains(lemma);
-
-                        // Проверка текущей длины сниппета
-                        if (snippetLength + snippetWord.length() + 7 > 300) { // 7 - длина тегов <b> и </b>
-                            break; // Прервать если достигли максимальной длины сниппета
-                        }
-
-                        if (highlightWord) {
-                            if (!previousWordWasHighlighted) {
-                                snippetBuilder.append("<b>");
-                            }
-                            snippetBuilder.append(snippetWord).append(" ");
-                            previousWordWasHighlighted = true;
-                        } else {
-                            if (previousWordWasHighlighted) {
-                                snippetBuilder.append("</b>");
-                            }
-                            snippetBuilder.append(snippetWord).append(" ");
-                            previousWordWasHighlighted = false;
-                        }
-
-                        // Обновление текущей длины сниппета
-                        snippetLength += snippetWord.length() + 1; // +1 для пробела между словами
-                    }
-
-                    // Завершение открытого тега <b> в случае, если последнее слово было выделено
-                    if (previousWordWasHighlighted) {
-                        snippetBuilder.append("</b>");
-                    }
-
-                    bestSnippet = snippetBuilder.toString().trim();
-                    maxMatchedWords = matchedWordsCount;
-                    snippetFound = true;
-                }
-            }
+        if (previousWordWasHighlighted) {
+            snippetBuilder.append("</b>");
         }
-
-        // Если не удалось найти подходящий сниппет, вернуть первые 300 символов контента
-        if (!snippetFound) {
-            bestSnippet = content.substring(0, Math.min(content.length(), 300));
-        }
-
-        return bestSnippet; // Вернуть сформированный сниппет
+        return snippetBuilder.toString().trim();
     }
 }
 

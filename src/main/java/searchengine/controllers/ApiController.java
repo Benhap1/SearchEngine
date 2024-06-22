@@ -24,53 +24,29 @@ public class ApiController {
     private final StatisticsService statisticsService;
     private final SiteIndexingService siteIndexingService;
     private final SitesList sitesList;
-    private boolean indexingInProgress = false; // Флаг, указывающий, идет ли индексация
-    private final Object lock = new Object(); // Добавляем объект для синхронизации доступа к флагу
-
 
     @GetMapping("/statistics")
     public ResponseEntity<StatisticsResponse> statistics() {
         return ResponseEntity.ok(statisticsService.getStatistics());
     }
 
-
     @GetMapping("/startIndexing")
     public ResponseEntity<String> startIndexing() {
-        synchronized (lock) {
-            if (indexingInProgress) {
-                return ResponseEntity.badRequest().body("{\"result\": false, \"error\": \"Индексация уже запущена\"}");
-            } else {
-                indexingInProgress = true;
-            }
+        boolean indexingStarted = siteIndexingService.startIndexing(sitesList.getSites());
+        if (!indexingStarted) {
+            return ResponseEntity.badRequest().body("{\"result\": false, \"error\": \"Индексация уже запущена\"}");
         }
-        // Отправляем сообщение о начале индексации клиенту
-        ResponseEntity<String> response = ResponseEntity.ok("{\"result\": true}");
-        // Начинаем индексацию (асинхронно)
-        new Thread(() -> {
-            try {
-                siteIndexingService.indexSites(sitesList.getSites());
-            } finally {
-                synchronized (lock) {
-                    indexingInProgress = false; // Сбрасываем флаг после завершения индексации
-                }
-            }
-        }).start();
-        return response;
+        return ResponseEntity.ok("{\"result\": true}");
     }
 
     @GetMapping("/stopIndexing")
     public ResponseEntity<?> stopIndexing() {
-        synchronized (lock) {
-            if (!indexingInProgress) {
-                return ResponseEntity.badRequest().body("{\"result\": false, \"error\": \"Индексация не запущена\"}");
-            } else {
-                indexingInProgress = false;
-            }
+        boolean indexingStopped = siteIndexingService.stopIndex();
+        if (!indexingStopped) {
+            return ResponseEntity.badRequest().body("{\"result\": false, \"error\": \"Индексация не запущена\"}");
         }
-        siteIndexingService.stopIndexing();
         return ResponseEntity.ok("{\"result\": true}");
     }
-
 
 
     @PostMapping("/indexPage")
