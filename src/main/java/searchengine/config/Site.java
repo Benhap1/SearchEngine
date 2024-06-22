@@ -1,7 +1,6 @@
 package searchengine.config;
 
 import lombok.*;
-import searchengine.model.SiteStatus;
 
 @Setter
 @Getter
