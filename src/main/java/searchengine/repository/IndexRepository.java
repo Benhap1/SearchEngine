@@ -13,4 +13,8 @@ public interface IndexRepository extends JpaRepository<IndexEntity, Long> {
 
     @Query("SELECT ie FROM IndexEntity ie WHERE ie.page = :page AND ie.lemma.lemma IN :lemmas")
     List<IndexEntity> findByPageAndLemmas(@Param("page") PageEntity page, @Param("lemmas") List<String> lemmas);
+
+    List<IndexEntity> findByPage(PageEntity pageEntity);
+
+    void deleteByPage(PageEntity pageEntity);
 }

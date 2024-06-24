@@ -504,7 +504,9 @@ public class SiteIndexingService {
 
 
     public boolean indexPage(String url) throws MalformedURLException {
-        URL parsedUrl = new URL(url);
+        // Нормализация URL
+        String normalizedUrl = normalizeUrl(url);
+        URL parsedUrl = new URL(normalizedUrl);
         String host = parsedUrl.getHost();
 
         Optional<SiteEntity> optionalSiteEntity = siteRepository.findByUrlContaining(host);
@@ -513,7 +515,7 @@ public class SiteIndexingService {
         }
 
         SiteEntity siteEntity = optionalSiteEntity.get();
-        indexPageEntity(siteEntity, url);
+        indexPageEntity(siteEntity, normalizedUrl);
 
         return true;
     }
@@ -526,6 +528,11 @@ public class SiteIndexingService {
 
             Optional<PageEntity> existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
             PageEntity pageEntity = existingPage.orElse(new PageEntity());
+
+            // Удаление старых индексов и коррекция частот лемм
+            if (existingPage.isPresent()) {
+                deleteOldIndicesAndAdjustLemmas(pageEntity);
+            }
 
             pageEntity.setSite(siteEntity);
             pageEntity.setPath(path);
@@ -545,6 +552,21 @@ public class SiteIndexingService {
             String errorMessage = String.format("Ошибка при индексации страницы %s: %s", url, e.getMessage());
             globalErrorsHandler.addError(errorMessage);
             log.error(errorMessage);
+        }
+    }
+
+
+    private void deleteOldIndicesAndAdjustLemmas(PageEntity pageEntity) {
+        List<IndexEntity> oldIndices = indexRepository.findByPage(pageEntity);
+
+        // Удаление всех старых индексов
+        indexRepository.deleteAll(oldIndices);
+
+        // Коррекция частот лемм
+        for (IndexEntity index : oldIndices) {
+            LemmaEntity lemma = index.getLemma();
+            lemma.setFrequency(lemma.getFrequency() - index.getRank().intValue());
+            lemmaRepository.save(lemma);
         }
     }
 
