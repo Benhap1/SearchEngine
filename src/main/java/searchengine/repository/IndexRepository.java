@@ -16,5 +16,4 @@ public interface IndexRepository extends JpaRepository<IndexEntity, Long> {
 
     List<IndexEntity> findByPage(PageEntity pageEntity);
 
-    void deleteByPage(PageEntity pageEntity);
 }
