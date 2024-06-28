@@ -60,10 +60,11 @@ public class SiteIndexingService {
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
 
-    public boolean startIndexing(List<Site> sites) {
+
+    public String startIndexing(List<Site> sites) {
         synchronized (lock) {
             if (indexingInProgress) {
-                return false;
+                return "{\"result\": false, \"error\": \"Индексация уже запущена\"}";
             }
             indexingInProgress = true;
         }
@@ -78,20 +79,19 @@ public class SiteIndexingService {
             }
         }).start();
 
-        return true;
+        return "{\"result\": true}";
     }
 
-    public boolean stopIndex() {
+    public String stopIndex() {
         synchronized (lock) {
             if (!indexingInProgress) {
-                return false;
+                return "{\"result\": false, \"error\": \"Индексация не запущена\"}";
             }
             stopRequested = true;
             indexingInProgress = false;
         }
-        return true;
+        return "{\"result\": true}";
     }
-
 
     public void indexSites(List<Site> sites) {
         log.info("Начало индексации сайтов: {}", sites);
@@ -104,6 +104,7 @@ public class SiteIndexingService {
         stopRequested = false;
 
         ForkJoinPool forkJoinPool = new ForkJoinPool(parallelism);
+
         try {
             forkJoinPool.submit(() -> sites.parallelStream().forEach(this::indexSite));
 
@@ -112,20 +113,16 @@ public class SiteIndexingService {
 
             if (!terminated) {
                 globalErrorsHandler.addError("ForkJoinPool не завершился в указанный срок");
-                log.warn("ForkJoinPool не завершился в указанный срок");
             }
             if (stopRequested) {
                 globalErrorsHandler.addError("Индексация была остановлена пользователем.");
-                log.info("Индексация была остановлена пользователем.");
             }
         } catch (InterruptedException e) {
             globalErrorsHandler.addError("Ошибка при ожидании завершения индексации сайтов: " + e.getMessage());
-            log.error("Ошибка при ожидании завершения индексации сайтов: {}", e.getMessage());
             Thread.currentThread().interrupt();
         } finally {
             if (!forkJoinPool.isTerminated()) {
                 globalErrorsHandler.addError("Принудительное завершение незавершенных задач в ForkJoinPool");
-                log.warn("Принудительное завершение незавершенных задач в ForkJoinPool");
                 forkJoinPool.shutdownNow();
             }
             synchronized (lock) {
@@ -146,7 +143,7 @@ public class SiteIndexingService {
 
     private void clearCache() {
         pageUrlCache.invalidateAll();
-        lemmaCache.invalidateAll();  // Добавить очистку кэша лемм
+        lemmaCache.invalidateAll();
         log.info("Кэш страниц и лемм очищен.");
     }
 
@@ -155,11 +152,11 @@ public class SiteIndexingService {
     protected void indexSite(Site site) {
         log.info("Начало индексации сайта: {}", site.getUrl());
         try {
-        updateSiteIndexingStatus(site);
-        SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
-                .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
-        indexPages(site.getUrl(), indexedSite);
-        updateSiteStatus(indexedSite);
+            updateSiteIndexingStatus(site);
+            SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
+                    .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
+            indexPages(site.getUrl(), indexedSite);
+            updateSiteStatus(indexedSite);
         } catch (Exception e) {
             String errorMessage = "Ошибка при индексации сайта " + site.getUrl() + ": " + e.getMessage();
             globalErrorsHandler.addError(errorMessage);
@@ -174,48 +171,48 @@ public class SiteIndexingService {
     protected void updateSiteIndexingStatus(Site site) {
         log.info("Установка статуса индексации для сайта: {}", site.getUrl());
         try {
-        if (indexRepository.count() > 0) {
-            log.info("Таблица indexx не пуста, удаляем данные");
-            indexRepository.deleteAllInBatch();
-        } else {
-            log.info("Таблица indexx пуста, удаление пропущено");
-        }
+            if (indexRepository.count() > 0) {
+                log.info("Таблица indexx не пуста, удаляем данные");
+                indexRepository.deleteAllInBatch();
+            } else {
+                log.info("Таблица indexx пуста, удаление пропущено");
+            }
 
-        if (lemmaRepository.count() > 0) {
-            log.info("Таблица lemma не пуста, удаляем данные");
-            lemmaRepository.deleteAllInBatch();
-        } else {
-            log.info("Таблица lemma пуста, удаление пропущено");
-        }
+            if (lemmaRepository.count() > 0) {
+                log.info("Таблица lemma не пуста, удаляем данные");
+                lemmaRepository.deleteAllInBatch();
+            } else {
+                log.info("Таблица lemma пуста, удаление пропущено");
+            }
 
-        if (pageRepository.count() > 0) {
-            log.info("Таблица page не пуста, удаляем данные");
-            pageRepository.deleteAllInBatch();
-        } else {
-            log.info("Таблица page пуста, удаление пропущено");
-        }
+            if (pageRepository.count() > 0) {
+                log.info("Таблица page не пуста, удаляем данные");
+                pageRepository.deleteAllInBatch();
+            } else {
+                log.info("Таблица page пуста, удаление пропущено");
+            }
 
-        if (siteRepository.count() > 0) {
-            log.info("Таблица site не пуста, удаляем данные");
-            siteRepository.deleteAllInBatch();
-        } else {
-            log.info("Таблица site пуста, удаление пропущено");
-        }
+            if (siteRepository.count() > 0) {
+                log.info("Таблица site не пуста, удаляем данные");
+                siteRepository.deleteAllInBatch();
+            } else {
+                log.info("Таблица site пуста, удаление пропущено");
+            }
 
-        SiteEntity indexedSite = new SiteEntity();
-        indexedSite.setUrl(site.getUrl());
-        indexedSite.setName(site.getName());
-        indexedSite.setStatus(SiteStatus.INDEXING.name());
-        indexedSite.setStatusTime(LocalDateTime.now());
-        try {
-            siteRepository.save(indexedSite);
-            log.info("Создана запись для сайта: {}", site.getUrl());
-        } catch (Exception e) {
-            log.error("Ошибка при создании записи для сайта {}: {}", site.getUrl(), e.getMessage());
-            return;
-        }
+            SiteEntity indexedSite = new SiteEntity();
+            indexedSite.setUrl(site.getUrl());
+            indexedSite.setName(site.getName());
+            indexedSite.setStatus(SiteStatus.INDEXING.name());
+            indexedSite.setStatusTime(LocalDateTime.now());
+            try {
+                siteRepository.save(indexedSite);
+                log.info("Создана запись для сайта: {}", site.getUrl());
+            } catch (Exception e) {
+                log.error("Ошибка при создании записи для сайта {}: {}", site.getUrl(), e.getMessage());
+                return;
+            }
 
-        log.info("Статус индексации для сайта установлен: {}", site.getUrl());
+            log.info("Статус индексации для сайта установлен: {}", site.getUrl());
         } catch (Exception e) {
             String errorMessage = "Ошибка при установке статуса индексации для сайта " + site.getUrl() + ": " + e.getMessage();
             globalErrorsHandler.addError(errorMessage);
@@ -503,6 +500,31 @@ public class SiteIndexingService {
     }
 
 
+    public Map<String, Object> processIndexPage(String url) {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            if (url == null || url.trim().isEmpty()) {
+                response.put("result", false);
+                response.put("error", "Пустой поисковый запрос");
+                return response;
+            }
+            boolean result = indexPage(url);
+            if (!result) {
+                response.put("result", false);
+                response.put("error", "Данная страница находится за пределами сайтов, указанных в конфигурационном файле");
+            } else {
+                response.put("result", true);
+            }
+        } catch (MalformedURLException e) {
+            response.put("result", false);
+            response.put("error", "Invalid URL format: " + e.getMessage());
+        } catch (RuntimeException e) {
+            response.put("result", false);
+            response.put("error", e.getMessage());
+        }
+        return response;
+    }
+
     public boolean indexPage(String url) throws MalformedURLException {
         // Нормализация URL
         String normalizedUrl = normalizeUrl(url);
@@ -520,7 +542,6 @@ public class SiteIndexingService {
         return true;
     }
 
-
     private void indexPageEntity(SiteEntity siteEntity, String url) {
         try {
             Document document = Jsoup.connect(url).get();
@@ -529,7 +550,7 @@ public class SiteIndexingService {
             Optional<PageEntity> existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
             PageEntity pageEntity = existingPage.orElse(new PageEntity());
 
-            // Удаление старых индексов и коррекция частот лемм
+
             if (existingPage.isPresent()) {
                 deleteOldIndicesAndAdjustLemmas(pageEntity);
             }
@@ -558,11 +579,8 @@ public class SiteIndexingService {
 
     private void deleteOldIndicesAndAdjustLemmas(PageEntity pageEntity) {
         List<IndexEntity> oldIndices = indexRepository.findByPage(pageEntity);
-
-        // Удаление всех старых индексов
         indexRepository.deleteAll(oldIndices);
 
-        // Коррекция частот лемм
         for (IndexEntity index : oldIndices) {
             LemmaEntity lemma = index.getLemma();
             lemma.setFrequency(lemma.getFrequency() - index.getRank().intValue());
@@ -571,9 +589,9 @@ public class SiteIndexingService {
     }
 
 
-
     public SearchResults search(String query, String site, int offset, int limit) {
-        log.info("Выполнение поиска для запроса: '{}', сайт: '{}', смещение: {}, лимит: {}", query, site, offset, limit);
+        validateSearchParameters(query);
+
         List<SearchResultDto> allResults = new ArrayList<>();
 
         if (site == null || site.isEmpty()) {
@@ -592,8 +610,14 @@ public class SiteIndexingService {
         int endIndex = Math.min(offset + limit, allResults.size());
         List<SearchResultDto> paginatedResults = allResults.subList(startIndex, endIndex);
 
-        log.info("Завершение поиска для запроса: '{}', сайт: '{}', смещение: {}, лимит: {}", query, site, offset, limit);
+        log.info("Search completed for query: '{}', site: '{}', offset: {}, limit: {}", query, site, offset, limit);
         return new SearchResults(true, allResults.size(), paginatedResults);
+    }
+
+    private void validateSearchParameters(String query) {
+        if (query == null || query.isEmpty()) {
+            throw new IllegalArgumentException("Пустой поисковый запрос");
+        }
     }
 
 
@@ -675,9 +699,9 @@ public class SiteIndexingService {
         result.setSiteName(page.getSite().getName());
         result.setUri(page.getPath());
         result.setTitle(extractTitle(page.getContent()));
-        result.setSnippet(createSnippet(page.getContent(), sortedLemmas)); // Используем query
+        result.setSnippet(createSnippet(page.getContent(), sortedLemmas));
         result.setRelevance(relevance);
-        System.out.println("Created SearchResultDto: " + result); // Добавляем вывод для отладки
+        System.out.println("Created SearchResultDto: " + result);
         return result;
     }
 
@@ -690,7 +714,6 @@ public class SiteIndexingService {
 
     private String createSnippet(String content, List<String> sortedLemmas) {
         String cleanContent = Jsoup.parse(content).text();
-        cleanContent = cleanContent.replaceAll("[^\\p{IsCyrillic}\\s]", " ");
         String bestSnippet = "";
         for (String lemma : sortedLemmas) {
             int keywordIndex = cleanContent.indexOf(lemma);

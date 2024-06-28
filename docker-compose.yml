@@ -3,13 +3,13 @@ version: '3.8'
 services:
   mysql:
     image: mysql:8.0
-    container_name: mysql-db
+    container_name: mysql-searchEngine
     restart: always
     ports:
       - "3306:3306"
     environment:
       MYSQL_ROOT_PASSWORD: root_password
-      MYSQL_DATABASE: db
+      MYSQL_DATABASE: searchengine
       MYSQL_USER: your_mysql_user
       MYSQL_PASSWORD: your_mysql_password
 
@@ -23,5 +23,5 @@ services:
       - MYSQL_HOST=mysql
       - MYSQL_ROOT_PASSWORD=root_password
     ports:
-      - "3307:3306"  # Mapping MySQL Workbench port to host
+      - "3307:3306"
 

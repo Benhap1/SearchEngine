@@ -1,15 +1,16 @@
 indexing-settings:
   sites:
-    - url: https://www.sendel.ru
+    - url: https://sendel.ru
       name: sendel.ru
-    - url: https://www.itdeti.ru
+    - url: https://itdeti.ru
       name: itdeti.ru
+
   fork-join-pool:
     parallelism: 20
 
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/db
+    url: jdbc:mysql://localhost:3306/searchengine
     username: root
     password: Benjamin1*
     driver-class-name: com.mysql.cj.jdbc.Driver

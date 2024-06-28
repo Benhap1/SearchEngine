@@ -14,9 +14,7 @@ import java.util.Optional;
 public interface PageRepository extends JpaRepository<PageEntity, Long> {
 
     long count();
-
     int countBySite(SiteEntity site);
-
     Optional<PageEntity> findBySiteAndPath(SiteEntity siteEntity, String path);
 
     @Query("SELECT p FROM PageEntity p JOIN IndexEntity i ON p.id = i.page.id JOIN LemmaEntity l ON i.lemma.id = l.id WHERE l.lemma IN :lemmas AND p.site.url = :site GROUP BY p.id HAVING COUNT(DISTINCT l.lemma) = :lemmasSize")
