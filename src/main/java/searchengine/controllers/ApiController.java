@@ -6,6 +6,8 @@ import org.springframework.web.bind.annotation.*;
 import searchengine.config.SitesList;
 import searchengine.dto.search.SearchResults;
 import searchengine.dto.statistics.StatisticsResponse;
+import searchengine.service.IndexPageCommand;
+import searchengine.service.SearchCommand;
 import searchengine.service.SiteIndexingService;
 import searchengine.services.StatisticsService;
 
@@ -20,6 +22,8 @@ public class ApiController {
     private final StatisticsService statisticsService;
     private final SiteIndexingService siteIndexingService;
     private final SitesList sitesList;
+    private final IndexPageCommand indexPageCommand;
+    private final SearchCommand searchCommand;
 
     @GetMapping("/statistics")
     public ResponseEntity<StatisticsResponse> statistics() {
@@ -42,7 +46,7 @@ public class ApiController {
 
     @PostMapping("/indexPage")
     public ResponseEntity<Map<String, Object>> indexPage(@RequestParam String url) {
-        Map<String, Object> response = siteIndexingService.processIndexPage(url);
+        Map<String, Object> response = indexPageCommand.processIndexPage(url);
         return ResponseEntity.ok(response);
     }
 
@@ -53,7 +57,7 @@ public class ApiController {
             @RequestParam(defaultValue = "0") int offset,
             @RequestParam(defaultValue = "10") int limit) {
 
-        SearchResults searchResults = siteIndexingService.search(query, site, offset, limit);
+        SearchResults searchResults = searchCommand.search(query, site, offset, limit);
         return ResponseEntity.ok(searchResults);
     }
 }

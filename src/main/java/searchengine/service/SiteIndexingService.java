@@ -10,9 +10,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import searchengine.config.Site;
-import searchengine.config.SitesList;
-import searchengine.dto.search.SearchResultDto;
-import searchengine.dto.search.SearchResults;
 import searchengine.model.*;
 import searchengine.repository.IndexRepository;
 import searchengine.repository.LemmaRepository;
@@ -25,9 +22,6 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import searchengine.util.GlobalErrorsHandler;
 
 @Slf4j
@@ -40,22 +34,12 @@ public class SiteIndexingService {
     private final LemmaRepository lemmaRepository;
     private final IndexRepository indexRepository;
     private final LemmaFinder lemmaFinder;
-    private final SitesList sitesList;
     private final GlobalErrorsHandler globalErrorsHandler;
-
-    public final Cache<String, Boolean> pageUrlCache = Caffeine.newBuilder()
-            .maximumSize(600) // Максимальное количество элементов в кэше
-            .expireAfterAccess(10, TimeUnit.MINUTES)
-            .build();
-
-    private final Cache<String, LemmaEntity> lemmaCache = Caffeine.newBuilder()
-            .maximumSize(10000) // Размер кэша
-            .expireAfterAccess(10, TimeUnit.MINUTES)
-            .build();
-
+    private final CacheManagement cacheManagement;
     private volatile boolean stopRequested = false;
     private boolean indexingInProgress = false;
     private final Object lock = new Object();
+    private final UrlNormalizer urlNormalizer;
 
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
@@ -135,16 +119,9 @@ public class SiteIndexingService {
             log.info("Ошибки, возникшие во время индексации: {}", errorsAfterIndexing);
         }
 
-        clearCache();
+        cacheManagement.clearCache();
 
         log.info("Конец индексации сайтов: {}", sites);
-    }
-
-
-    private void clearCache() {
-        pageUrlCache.invalidateAll();
-        lemmaCache.invalidateAll();
-        log.info("Кэш страниц и лемм очищен.");
     }
 
 
@@ -165,7 +142,6 @@ public class SiteIndexingService {
 
         log.info("Завершение индексации сайта: {}", site.getUrl());
     }
-
 
     @Transactional
     protected void updateSiteIndexingStatus(Site site) {
@@ -221,24 +197,6 @@ public class SiteIndexingService {
     }
 
 
-    private String normalizeUrl(String url) {
-        try {
-            URL uri = new URL(url);
-            String path = uri.getPath().replaceAll("/{2,}", "/").replaceAll("/$", "");
-            if (path.isEmpty()) {
-                path = "/";
-            }
-            return new URL(uri.getProtocol(), uri.getHost(), path).toString().toLowerCase();
-        } catch (MalformedURLException e) {
-            String errorMessage = "Ошибка при нормализации URL: " + e.getMessage();
-            globalErrorsHandler.addError(errorMessage);
-            log.error(errorMessage);
-
-            return url.toLowerCase().replaceAll("/{2,}", "/").replaceAll("/$", ""); // возвращаем нормализованный URL даже при ошибке
-        }
-    }
-
-
     private void indexPages(String baseUrl, SiteEntity indexedSite) {
         if (stopRequested) return;
         log.info("Начало индексации страниц сайта: {}", baseUrl);
@@ -261,15 +219,15 @@ public class SiteIndexingService {
     public void visitPage(Document document, String url, SiteEntity siteEntity, ConcurrentHashMap<String, Boolean> visitedUrls) {
         if (stopRequested) return;
 
-        String normalizedUrl = normalizeUrl(url);
+        String normalizedUrl = urlNormalizer.normalizeUrl(url);
         log.info("Начало обработки страницы: {}", normalizedUrl);
         visitedUrls.putIfAbsent(normalizedUrl, true);
 
-        if (pageUrlCache.getIfPresent(normalizedUrl) != null) {
+        if (cacheManagement.pageUrlCache.getIfPresent(normalizedUrl) != null) {
             log.info("Страница уже была обработана: {}", normalizedUrl);
             return;
         }
-        pageUrlCache.put(normalizedUrl, true);
+        cacheManagement.pageUrlCache.put(normalizedUrl, true);
 
         if (isFileUrl(normalizedUrl)) {
             log.info("Пропуск файла: {}", normalizedUrl);
@@ -288,6 +246,7 @@ public class SiteIndexingService {
 
         log.info("Завершение обработки страницы: {}", normalizedUrl);
     }
+
 
 
 
@@ -366,7 +325,7 @@ public class SiteIndexingService {
         try {
             links.forEach(link -> {
                 String nextUrl = link.absUrl("href");
-                String normalizedNextUrl = normalizeUrl(nextUrl);
+                String normalizedNextUrl = urlNormalizer.normalizeUrl(nextUrl);
                 if (visitedUrls.putIfAbsent(normalizedNextUrl, true) == null && isInternalLink(normalizedNextUrl, siteEntity.getUrl())) {
                     forkJoinPool.submit(() -> {
                         if (stopRequested) {
@@ -413,8 +372,8 @@ public class SiteIndexingService {
 
 
 
-    private LemmaEntity getOrCreateLemma(String lemma, SiteEntity site) {  //изменил паблик на прайвет)
-        return lemmaCache.get(lemma, key -> {
+    private LemmaEntity getOrCreateLemma(String lemma, SiteEntity site) {
+        return cacheManagement.lemmaCache.get(lemma, key -> {
             LemmaEntity existingLemma = lemmaRepository.findByLemmaAndSite(key, site).orElse(null);
             if (existingLemma != null) {
                 return existingLemma;
@@ -431,7 +390,7 @@ public class SiteIndexingService {
 
 
     @Synchronized
-    private void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) { //изменил паблик на прайвет
+    protected void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) { //изменил паблик на прайвет
         if (stopRequested) return;
         List<LemmaEntity> lemmaEntities = new ArrayList<>();
         List<IndexEntity> indexEntities = new ArrayList<>();
@@ -454,8 +413,8 @@ public class SiteIndexingService {
 
 
     private boolean isInternalLink(String url, String baseUrl) {
-        String normalizedUrl = normalizeUrl(url);
-        String normalizedBaseUrl = normalizeUrl(baseUrl);
+        String normalizedUrl = urlNormalizer.normalizeUrl(url);
+        String normalizedBaseUrl = urlNormalizer.normalizeUrl(baseUrl);
 
         try {
             URL nextUrl = new URL(normalizedUrl);
@@ -472,7 +431,6 @@ public class SiteIndexingService {
             return false;
         }
     }
-
 
 
     @Transactional
@@ -497,273 +455,6 @@ public class SiteIndexingService {
             globalErrorsHandler.addError(errorMessage);
             log.error(errorMessage);
         }
-    }
-
-
-    public Map<String, Object> processIndexPage(String url) {
-        Map<String, Object> response = new HashMap<>();
-        try {
-            if (url == null || url.trim().isEmpty()) {
-                response.put("result", false);
-                response.put("error", "Пустой поисковый запрос");
-                return response;
-            }
-            boolean result = indexPage(url);
-            if (!result) {
-                response.put("result", false);
-                response.put("error", "Данная страница находится за пределами сайтов, указанных в конфигурационном файле");
-            } else {
-                response.put("result", true);
-            }
-        } catch (MalformedURLException e) {
-            response.put("result", false);
-            response.put("error", "Invalid URL format: " + e.getMessage());
-        } catch (RuntimeException e) {
-            response.put("result", false);
-            response.put("error", e.getMessage());
-        }
-        return response;
-    }
-
-    public boolean indexPage(String url) throws MalformedURLException {
-        // Нормализация URL
-        String normalizedUrl = normalizeUrl(url);
-        URL parsedUrl = new URL(normalizedUrl);
-        String host = parsedUrl.getHost();
-
-        Optional<SiteEntity> optionalSiteEntity = siteRepository.findByUrlContaining(host);
-        if (optionalSiteEntity.isEmpty()) {
-            return false;
-        }
-
-        SiteEntity siteEntity = optionalSiteEntity.get();
-        indexPageEntity(siteEntity, normalizedUrl);
-
-        return true;
-    }
-
-    private void indexPageEntity(SiteEntity siteEntity, String url) {
-        try {
-            Document document = Jsoup.connect(url).get();
-            String path = new URL(url).getPath();
-
-            Optional<PageEntity> existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
-            PageEntity pageEntity = existingPage.orElse(new PageEntity());
-
-
-            if (existingPage.isPresent()) {
-                deleteOldIndicesAndAdjustLemmas(pageEntity);
-            }
-
-            pageEntity.setSite(siteEntity);
-            pageEntity.setPath(path);
-            pageEntity.setContent(document.outerHtml());
-
-            int statusCode = Jsoup.connect(url).execute().statusCode();
-            pageEntity.setCode(statusCode);
-
-            pageRepository.save(pageEntity);
-
-            Map<String, Integer> lemmas = lemmaFinder.collectLemmas(pageEntity.getContent());
-
-            saveLemmasAndIndices(siteEntity, pageEntity, lemmas);
-
-            log.info("Страница {} успешно индексирована", url);
-        } catch (IOException e) {
-            String errorMessage = String.format("Ошибка при индексации страницы %s: %s", url, e.getMessage());
-            globalErrorsHandler.addError(errorMessage);
-            log.error(errorMessage);
-        }
-    }
-
-
-    private void deleteOldIndicesAndAdjustLemmas(PageEntity pageEntity) {
-        List<IndexEntity> oldIndices = indexRepository.findByPage(pageEntity);
-        indexRepository.deleteAll(oldIndices);
-
-        for (IndexEntity index : oldIndices) {
-            LemmaEntity lemma = index.getLemma();
-            lemma.setFrequency(lemma.getFrequency() - index.getRank().intValue());
-            lemmaRepository.save(lemma);
-        }
-    }
-
-
-    public SearchResults search(String query, String site, int offset, int limit) {
-        validateSearchParameters(query);
-
-        List<SearchResultDto> allResults = new ArrayList<>();
-
-        if (site == null || site.isEmpty()) {
-            for (Site currentSite : sitesList.getSites()) {
-                List<SearchResultDto> siteResults = performSearch(query, currentSite.getUrl());
-                allResults.addAll(siteResults);
-            }
-        } else {
-            List<SearchResultDto> siteResults = performSearch(query, site);
-            allResults.addAll(siteResults);
-        }
-
-        allResults.sort(Comparator.comparingDouble(SearchResultDto::getRelevance).reversed());
-
-        int startIndex = Math.min(offset, allResults.size());
-        int endIndex = Math.min(offset + limit, allResults.size());
-        List<SearchResultDto> paginatedResults = allResults.subList(startIndex, endIndex);
-
-        log.info("Search completed for query: '{}', site: '{}', offset: {}, limit: {}", query, site, offset, limit);
-        return new SearchResults(true, allResults.size(), paginatedResults);
-    }
-
-    private void validateSearchParameters(String query) {
-        if (query == null || query.isEmpty()) {
-            throw new IllegalArgumentException("Пустой поисковый запрос");
-        }
-    }
-
-
-    private List<SearchResultDto> performSearch(String query, String site) {
-        Set<String> lemmas = lemmaFinder.getLemmaSet(query);
-        double maxAllowedFrequencyPercentage = 1.0;
-        Set<String> filteredLemmas = filterFrequentLemmas(lemmas, maxAllowedFrequencyPercentage);
-        List<String> sortedLemmas = sortLemmasByFrequency(filteredLemmas);
-
-        List<PageEntity> pages = findPagesByLemmas(sortedLemmas, site);
-        if (pages.isEmpty()) {
-            return Collections.emptyList();
-        }
-
-        List<SearchResultDto> searchResults = new ArrayList<>();
-        double maxRelevance = 0.0;
-
-        for (PageEntity page : pages) {
-            double relevance = calculateRelevance(page, sortedLemmas);
-            if (relevance > maxRelevance) {
-                maxRelevance = relevance;
-            }
-            searchResults.add(createSearchResult(page, relevance, sortedLemmas));
-        }
-
-        for (SearchResultDto result : searchResults) {
-            result.setRelevance(result.getRelevance() / maxRelevance);
-        }
-
-        searchResults.sort(Comparator.comparingDouble(SearchResultDto::getRelevance).reversed());
-
-        return searchResults;
-    }
-
-
-    private List<String> sortLemmasByFrequency(Set<String> lemmas) {
-        Map<String, Integer> lemmaFrequencyMap = new HashMap<>();
-        for (String lemma : lemmas) {
-            int frequency = lemmaRepository.countByLemma(lemma);
-            lemmaFrequencyMap.put(lemma, frequency);
-        }
-
-        return lemmaFrequencyMap.entrySet().stream()
-                .sorted(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toList());
-    }
-
-    private Set<String> filterFrequentLemmas(Set<String> lemmas, double maxAllowedFrequencyPercentage) {
-        Set<String> filteredLemmas = new HashSet<>();
-        int totalPageCount = (int) pageRepository.count();
-
-        for (String lemma : lemmas) {
-            int lemmaFrequency = lemmaRepository.countByLemma(lemma);
-            double frequencyPercentage = (double) lemmaFrequency / totalPageCount;
-            if (frequencyPercentage <= maxAllowedFrequencyPercentage) {
-                filteredLemmas.add(lemma);
-            }
-        }
-        return filteredLemmas;
-    }
-
-
-    private List<PageEntity> findPagesByLemmas(List<String> sortedLemmas, String site) {
-        return pageRepository.findPagesByLemmasAndSite(sortedLemmas, site, sortedLemmas.size());
-    }
-
-    private double calculateRelevance(PageEntity page, List<String> sortedLemmas) {
-        List<IndexEntity> indices = indexRepository.findByPageAndLemmas(page, sortedLemmas);
-        return indices.stream()
-                .mapToDouble(IndexEntity::getRank)
-                .sum();
-    }
-
-
-    private SearchResultDto createSearchResult(PageEntity page, double relevance, List<String> sortedLemmas) {
-        SearchResultDto result = new SearchResultDto();
-        result.setSite(page.getSite().getUrl());
-        result.setSiteName(page.getSite().getName());
-        result.setUri(page.getPath());
-        result.setTitle(extractTitle(page.getContent()));
-        result.setSnippet(createSnippet(page.getContent(), sortedLemmas));
-        result.setRelevance(relevance);
-        System.out.println("Created SearchResultDto: " + result);
-        return result;
-    }
-
-
-    private String extractTitle(String content) {
-        Document document = Jsoup.parse(content);
-        return document.title();
-    }
-
-
-    private String createSnippet(String content, List<String> sortedLemmas) {
-        String cleanContent = Jsoup.parse(content).text();
-        String bestSnippet = "";
-        for (String lemma : sortedLemmas) {
-            int keywordIndex = cleanContent.indexOf(lemma);
-            if (keywordIndex != -1) {
-                int snippetStart = Math.max(0, keywordIndex - 150);
-                int snippetEnd = Math.min(cleanContent.length(), keywordIndex + lemma.length() + 150);
-                bestSnippet = cleanContent.substring(snippetStart, snippetEnd);
-                bestSnippet = highlightKeywords(bestSnippet, sortedLemmas);
-
-                return bestSnippet;
-            }
-        }
-
-        if (cleanContent.length() > 300) {
-            bestSnippet = cleanContent.substring(0, 300);
-        }
-
-        bestSnippet = highlightKeywords(bestSnippet, sortedLemmas);
-
-        return bestSnippet;
-    }
-
-    private String highlightKeywords(String snippet, List<String> sortedLemmas) {
-        StringBuilder snippetBuilder = new StringBuilder();
-        String[] words = snippet.split("\\s+");
-        boolean previousWordWasHighlighted = false;
-
-        for (String word : words) {
-            List<String> lemmas = lemmaFinder.getLemmaSet(word).stream().toList();
-            String lemma = lemmas.isEmpty() ? word : lemmas.get(0); // Use first lemma if available
-            boolean highlightWord = sortedLemmas.contains(lemma);
-
-            if (highlightWord) {
-                if (!previousWordWasHighlighted) {
-                    snippetBuilder.append("<b>");
-                }
-                snippetBuilder.append(word).append(" ");
-                previousWordWasHighlighted = true;
-            } else {
-                if (previousWordWasHighlighted) {
-                    snippetBuilder.append("</b>");
-                }
-                snippetBuilder.append(word).append(" ");
-                previousWordWasHighlighted = false;
-            }
-        }
-        if (previousWordWasHighlighted) {
-            snippetBuilder.append("</b>");
-        }
-        return snippetBuilder.toString().trim();
     }
 }
 

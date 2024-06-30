@@ -14,6 +14,8 @@ import searchengine.controllers.ApiController;
 import searchengine.dto.search.SearchResultDto;
 import searchengine.dto.search.SearchResults;
 import searchengine.dto.statistics.*;
+import searchengine.service.IndexPageCommand;
+import searchengine.service.SearchCommand;
 import searchengine.services.StatisticsService;
 import searchengine.service.SiteIndexingService;
 import java.util.*;
@@ -36,7 +38,13 @@ public class ApiControllerTest {
     private SiteIndexingService siteIndexingService;
 
     @Mock
+    private IndexPageCommand indexPageCommand;
+
+    @Mock
     private SitesList sitesList;
+
+    @Mock
+    private SearchCommand searchCommand;
 
     private AutoCloseable mocks;
 
@@ -85,12 +93,12 @@ public class ApiControllerTest {
     public void testIndexPage_Success() {
         Map<String, Object> successResponse = new HashMap<>();
         successResponse.put("result", true);
-        when(siteIndexingService.processIndexPage(anyString())).thenReturn(successResponse);
+        when(indexPageCommand.processIndexPage(anyString())).thenReturn(successResponse);
         ResponseEntity<Map<String, Object>> responseEntity = apiController.indexPage("http://example.com");
         assertEquals(HttpStatus.OK, responseEntity.getStatusCode());
         assertEquals(true, Objects.requireNonNull(responseEntity.getBody()).get("result"));
         assertNull(responseEntity.getBody().get("error"));
-        verify(siteIndexingService, times(1)).processIndexPage("http://example.com");
+        verify(indexPageCommand, times(1)).processIndexPage("http://example.com");
     }
 
     @Test
@@ -98,13 +106,13 @@ public class ApiControllerTest {
         Map<String, Object> failureResponse = new HashMap<>();
         failureResponse.put("result", false);
         failureResponse.put("error", "Данная страница находится за пределами сайтов, указанных в конфигурационном файле");
-        when(siteIndexingService.processIndexPage(anyString())).thenReturn(failureResponse);
+        when(indexPageCommand.processIndexPage(anyString())).thenReturn(failureResponse);
         ResponseEntity<Map<String, Object>> responseEntity = apiController.indexPage("http://example.com");
         assertEquals(HttpStatus.OK, responseEntity.getStatusCode());
         assertEquals(false, Objects.requireNonNull(responseEntity.getBody()).get("result"));
         assertEquals("Данная страница находится за пределами сайтов, указанных в конфигурационном файле",
                 responseEntity.getBody().get("error"));
-        verify(siteIndexingService, times(1)).processIndexPage("http://example.com");
+        verify(indexPageCommand, times(1)).processIndexPage("http://example.com");
     }
 
 
@@ -155,7 +163,7 @@ public class ApiControllerTest {
         );
         when(sitesList.getSites()).thenReturn(mockSites);
         SearchResults mockSearchResults = createMockSearchResults();
-        when(siteIndexingService.search(query, null, offset, limit)).thenReturn(mockSearchResults);
+        when(searchCommand.search(query, null, offset, limit)).thenReturn(mockSearchResults);
         ResponseEntity<?> responseEntity = apiController.search(query, null, offset, limit);
         assertEquals(HttpStatus.OK.value(), responseEntity.getStatusCode().value());
         Object responseBody = responseEntity.getBody();
