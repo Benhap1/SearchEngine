@@ -376,29 +376,5 @@ public class SiteIndexingService {
 
         });
     }
-
-
-//    @Transactional
-//    protected void updateSiteStatus(SiteEntity siteEntity) {
-//        if (stopRequested) {
-//            log.info("Индексация остановлена пользователем.");
-//            siteEntity.setStatus(SiteStatus.FAILED.name());
-//            siteEntity.setStatusTime(LocalDateTime.now());
-//            siteEntity.setLastError("Индексация прервана пользователем!");
-//        } else {
-//            log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
-//            siteEntity.setStatus(SiteStatus.INDEXED.name());
-//            siteEntity.setStatusTime(LocalDateTime.now());
-//            siteEntity.setLastError(null);
-//        }
-//        try {
-//            siteRepository.save(siteEntity);
-//            log.info("Завершение полной индексации и лемматизации сайта: {}", siteEntity.getUrl());
-//        } catch (Exception e) {
-//            String errorMessage = String.format("Ошибка при обновлении статуса сайта %s: %s", siteEntity.getUrl(), e.getMessage());
-//            globalErrorsHandler.addError(errorMessage);
-//            log.error(errorMessage);
-//        }
-//    }
 }
 
