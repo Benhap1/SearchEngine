@@ -1,7 +1,7 @@
 indexing-settings:
   sites:
-    - url: https://www.brandforce.com
-      name: brandforce.com
+    - url: https://www.baeldung.com
+      name: baeldung.com
     - url: https://sendel.ru
       name: sendel.ru
 

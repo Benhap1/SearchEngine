@@ -38,6 +38,7 @@ public class IndexPageCommand {
     private final SiteIndexingService siteIndexingService;
     private final UrlNormalizer urlNormalizer;
 
+
     @Transactional
     public Map<String, Object> processIndexPage(String url) {
         Map<String, Object> response = new HashMap<>();
@@ -56,14 +57,13 @@ public class IndexPageCommand {
             }
         } catch (MalformedURLException e) {
             response.put("result", false);
-            response.put("error", "Invalid URL format: " + e.getMessage());
+            response.put("error", "Неправильный формат URL");
         } catch (RuntimeException e) {
             response.put("result", false);
             response.put("error", e.getMessage());
         }
         return response;
     }
-
 
     @Transactional
     protected boolean indexPage(String url) throws MalformedURLException {

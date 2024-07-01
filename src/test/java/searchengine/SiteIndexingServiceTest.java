@@ -66,8 +66,8 @@
 //        }
 //
 //        @Override
-//        protected void updateSiteIndexingStatus(Site site) {
-//            super.updateSiteIndexingStatus(site);
+//        protected void siteIndexingStatusAfterStart(Site site) {
+//            super.siteIndexingStatusAfterStart(site);
 //        }
 //    }
 //
@@ -83,7 +83,7 @@
 //        when(pageRepository.count()).thenReturn(1L);
 //        when(siteRepository.count()).thenReturn(1L);
 //        when(siteRepository.findByUrl(any(String.class))).thenReturn(Optional.of(new SiteEntity()));
-//        testableService.updateSiteIndexingStatus(site);
+//        testableService.siteIndexingStatusAfterStart(site);
 //        verify(indexRepository).deleteAllInBatch();
 //        verify(lemmaRepository).deleteAllInBatch();
 //        verify(pageRepository).deleteAllInBatch();

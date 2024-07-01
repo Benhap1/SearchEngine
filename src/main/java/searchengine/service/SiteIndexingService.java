@@ -36,13 +36,31 @@ public class SiteIndexingService {
     private final LemmaFinder lemmaFinder;
     private final GlobalErrorsHandler globalErrorsHandler;
     private final CacheManagement cacheManagement;
-    private volatile boolean stopRequested = false;
+    protected volatile boolean stopRequested = false;
     private boolean indexingInProgress = false;
     private final Object lock = new Object();
     private final UrlNormalizer urlNormalizer;
+    private final UrlHelper urlHelper;
+    private final PageEntityCreator pageEntityCreator;
+    private final SiteStatusUpdateService siteStatusUpdateService;
+
 
     @Value("${indexing-settings.fork-join-pool.parallelism}")
     private int parallelism;
+
+
+    private static final Set<String> FILE_EXTENSIONS = Set.of(
+            ".pdf", ".png", ".jpg", ".doc", ".docx", ".xls", ".xlsx",
+            ".ppt", ".pptx", ".txt", ".rtf", ".jpeg", ".gif", ".bmp",
+            ".tiff", ".svg", ".webp", ".mp4", ".avi", ".mkv", ".mov",
+            ".wmv", ".flv", ".mp3", ".wav", ".aac", ".flac", ".ogg",
+            ".zip", ".rar", ".7z", ".tar", ".gz", ".exe", ".dmg",
+            ".iso", ".apk"
+    );
+
+    private static final Set<String> UNSUPPORTED_PROTOCOLS = Set.of(
+            "javascript", "mailto", "ftp", "file"
+    );
 
 
     public String startIndexing(List<Site> sites) {
@@ -52,7 +70,6 @@ public class SiteIndexingService {
             }
             indexingInProgress = true;
         }
-
         new Thread(() -> {
             try {
                 indexSites(sites);
@@ -86,15 +103,11 @@ public class SiteIndexingService {
         }
 
         stopRequested = false;
-
         ForkJoinPool forkJoinPool = new ForkJoinPool(parallelism);
-
         try {
             forkJoinPool.submit(() -> sites.parallelStream().forEach(this::indexSite));
-
             forkJoinPool.shutdown();
             boolean terminated = forkJoinPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-
             if (!terminated) {
                 globalErrorsHandler.addError("ForkJoinPool не завершился в указанный срок");
             }
@@ -118,9 +131,7 @@ public class SiteIndexingService {
         if (!errorsAfterIndexing.isEmpty()) {
             log.info("Ошибки, возникшие во время индексации: {}", errorsAfterIndexing);
         }
-
         cacheManagement.clearCache();
-
         log.info("Конец индексации сайтов: {}", sites);
     }
 
@@ -128,23 +139,30 @@ public class SiteIndexingService {
     @Transactional
     protected void indexSite(Site site) {
         log.info("Начало индексации сайта: {}", site.getUrl());
+        boolean hasError = false;
+        String errorMessage = null;
         try {
-            updateSiteIndexingStatus(site);
+            siteIndexingStatusAfterStart(site);
             SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
                     .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
             indexPages(site.getUrl(), indexedSite);
-            updateSiteStatus(indexedSite);
         } catch (Exception e) {
-            String errorMessage = "Ошибка при индексации сайта " + site.getUrl() + ": " + e.getMessage();
+            hasError = true;
+            errorMessage = "Ошибка при индексации сайта " + site.getUrl() + ": " + e.getMessage();
             globalErrorsHandler.addError(errorMessage);
             log.error(errorMessage, e);
+        } finally {
+            SiteEntity indexedSite = siteRepository.findByUrl(site.getUrl())
+                    .orElseThrow(() -> new RuntimeException("Не удалось получить запись для сайта: " + site.getUrl()));
+            siteStatusUpdateService.updateSiteStatus(indexedSite, stopRequested, hasError, errorMessage);
         }
-
         log.info("Завершение индексации сайта: {}", site.getUrl());
     }
 
+
+
     @Transactional
-    protected void updateSiteIndexingStatus(Site site) {
+    protected void siteIndexingStatusAfterStart(Site site) {
         log.info("Установка статуса индексации для сайта: {}", site.getUrl());
         try {
             if (indexRepository.count() > 0) {
@@ -234,7 +252,7 @@ public class SiteIndexingService {
             return;
         }
 
-        PageEntity pageEntity = createPageEntity(document, normalizedUrl, siteEntity);
+        PageEntity pageEntity = pageEntityCreator.createPageEntity(document, normalizedUrl, siteEntity);
         if (pageEntity == null) {
             log.error("Не удалось создать запись для страницы: {}", normalizedUrl);
             return;
@@ -248,71 +266,16 @@ public class SiteIndexingService {
     }
 
 
-
-
-
     private boolean isFileUrl(String url) {
-        return url.endsWith(".pdf") || url.endsWith(".png") || url.endsWith(".jpg");
-    }
-
-
-    private PageEntity createPageEntity(Document document, String url, SiteEntity siteEntity) {
-        log.info("Начало создания записи страницы: {}", url);
-
-        String path;
         try {
             URL parsedUrl = new URL(url);
-            path = parsedUrl.getPath().replaceAll("/{2,}", "/").replaceAll("/$", "");
-
-            if (path.isEmpty()) {
-                path = "/";
+            if (UNSUPPORTED_PROTOCOLS.contains(parsedUrl.getProtocol().toLowerCase())) {
+                return true;
             }
         } catch (MalformedURLException e) {
-            String errorMessage = "Ошибка при разборе URL " + url + ": " + e.getMessage();
-            globalErrorsHandler.addError(errorMessage);
-            log.error(errorMessage);
-            return null;
+            return true;
         }
-
-        Optional<PageEntity> existingPage;
-        try {
-            existingPage = pageRepository.findBySiteAndPath(siteEntity, path);
-            if (existingPage.isPresent()) {
-                log.info("Запись для страницы уже существует: {}", url);
-                return existingPage.get();
-            }
-
-            PageEntity pageEntity = new PageEntity();
-            pageEntity.setSite(siteEntity);
-            pageEntity.setPath(path);
-
-            int statusCode;
-            try {
-                statusCode = Jsoup.connect(url).execute().statusCode();
-                pageEntity.setCode(statusCode);
-                pageEntity.setContent(document.outerHtml());
-                pageRepository.save(pageEntity);
-                log.info("Запись страницы успешно сохранена: {}", url);
-                return pageEntity;
-            } catch (IOException e) {
-                String errorMessage = "Ошибка при получении статуса страницы " + url + ": " + e.getMessage();
-                globalErrorsHandler.addError(errorMessage);
-                log.error(errorMessage);
-            } catch (Exception e) {
-                String errorMessage = "Ошибка при сохранении содержимого страницы " + url + ": " + e.getMessage();
-                globalErrorsHandler.addError(errorMessage);
-                log.error(errorMessage);
-            } finally {
-                log.info("Завершение создания записи страницы: {}", url);
-            }
-
-        } catch (Exception e) {
-            String errorMessage = "Ошибка при поиске записи страницы для сайта " + siteEntity.getUrl() + ": " + e.getMessage();
-            globalErrorsHandler.addError(errorMessage);
-            log.error(errorMessage);
-        }
-
-        return null;
+        return FILE_EXTENSIONS.stream().anyMatch(url::endsWith);
     }
 
 
@@ -326,7 +289,14 @@ public class SiteIndexingService {
             links.forEach(link -> {
                 String nextUrl = link.absUrl("href");
                 String normalizedNextUrl = urlNormalizer.normalizeUrl(nextUrl);
-                if (visitedUrls.putIfAbsent(normalizedNextUrl, true) == null && isInternalLink(normalizedNextUrl, siteEntity.getUrl())) {
+
+                // Пропуск ссылок на файлы
+                if (isFileUrl(normalizedNextUrl)) {
+                    log.info("Пропуск файла: {}", normalizedNextUrl);
+                    return;
+                }
+
+                if (visitedUrls.putIfAbsent(normalizedNextUrl, true) == null && urlHelper.isInternalLink(normalizedNextUrl, siteEntity.getUrl())) {
                     forkJoinPool.submit(() -> {
                         if (stopRequested) {
                             log.info("Индексация остановлена пользователем.");
@@ -371,6 +341,25 @@ public class SiteIndexingService {
     }
 
 
+    @Synchronized
+    protected void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) { //изменил паблик на прайвет
+        if (stopRequested) return;
+        List<LemmaEntity> lemmaEntities = new ArrayList<>();
+        List<IndexEntity> indexEntities = new ArrayList<>();
+        lemmas.forEach((lemma, frequency) -> {
+            LemmaEntity lemmaEntity = getOrCreateLemma(lemma, siteEntity);
+            lemmaEntity.setFrequency(lemmaEntity.getFrequency() + frequency);
+            lemmaEntities.add(lemmaEntity);
+            IndexEntity indexEntity = new IndexEntity();
+            indexEntity.setPage(pageEntity);
+            indexEntity.setLemma(lemmaEntity);
+            indexEntity.setRank(Float.valueOf(frequency));
+            indexEntities.add(indexEntity);
+        });
+        lemmaRepository.saveAll(lemmaEntities);
+        indexRepository.saveAll(indexEntities);
+    }
+
 
     private LemmaEntity getOrCreateLemma(String lemma, SiteEntity site) {
         return cacheManagement.lemmaCache.get(lemma, key -> {
@@ -389,72 +378,27 @@ public class SiteIndexingService {
     }
 
 
-    @Synchronized
-    protected void saveLemmasAndIndices(SiteEntity siteEntity, PageEntity pageEntity, Map<String, Integer> lemmas) { //изменил паблик на прайвет
-        if (stopRequested) return;
-        List<LemmaEntity> lemmaEntities = new ArrayList<>();
-        List<IndexEntity> indexEntities = new ArrayList<>();
-
-        lemmas.forEach((lemma, frequency) -> {
-            LemmaEntity lemmaEntity = getOrCreateLemma(lemma, siteEntity);
-            lemmaEntity.setFrequency(lemmaEntity.getFrequency() + frequency);
-            lemmaEntities.add(lemmaEntity);
-
-            IndexEntity indexEntity = new IndexEntity();
-            indexEntity.setPage(pageEntity);
-            indexEntity.setLemma(lemmaEntity);
-            indexEntity.setRank(Float.valueOf(frequency));
-            indexEntities.add(indexEntity);
-        });
-
-        lemmaRepository.saveAll(lemmaEntities);
-        indexRepository.saveAll(indexEntities);
-    }
-
-
-    private boolean isInternalLink(String url, String baseUrl) {
-        String normalizedUrl = urlNormalizer.normalizeUrl(url);
-        String normalizedBaseUrl = urlNormalizer.normalizeUrl(baseUrl);
-
-        try {
-            URL nextUrl = new URL(normalizedUrl);
-            URL base = new URL(normalizedBaseUrl);
-
-            String nextHost = nextUrl.getHost().replaceAll("^(http://|https://|www\\.)", "");
-            String baseHost = base.getHost().replaceAll("^(http://|https://|www\\.)", "");
-
-            return nextHost.contains(baseHost);
-        } catch (MalformedURLException e) {
-            String errorMessage = "Ошибка при разборе URL: " + e.getMessage();
-            globalErrorsHandler.addError(errorMessage);
-            log.error(errorMessage);
-            return false;
-        }
-    }
-
-
-    @Transactional
-    protected void updateSiteStatus(SiteEntity siteEntity) {
-        if (stopRequested) {
-            log.info("Индексация остановлена пользователем.");
-            siteEntity.setStatus(SiteStatus.FAILED.name());
-            siteEntity.setStatusTime(LocalDateTime.now());
-            siteEntity.setLastError("Индексация прервана пользователем!");
-        } else {
-            log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
-            siteEntity.setStatus(SiteStatus.INDEXED.name());
-            siteEntity.setStatusTime(LocalDateTime.now());
-            siteEntity.setLastError(null);
-        }
-
-        try {
-            siteRepository.save(siteEntity);
-            log.info("Завершение полной индексации и лемматизации сайта: {}", siteEntity.getUrl());
-        } catch (Exception e) {
-            String errorMessage = String.format("Ошибка при обновлении статуса сайта %s: %s", siteEntity.getUrl(), e.getMessage());
-            globalErrorsHandler.addError(errorMessage);
-            log.error(errorMessage);
-        }
-    }
+//    @Transactional
+//    protected void updateSiteStatus(SiteEntity siteEntity) {
+//        if (stopRequested) {
+//            log.info("Индексация остановлена пользователем.");
+//            siteEntity.setStatus(SiteStatus.FAILED.name());
+//            siteEntity.setStatusTime(LocalDateTime.now());
+//            siteEntity.setLastError("Индексация прервана пользователем!");
+//        } else {
+//            log.info("Начало обновления статуса сайта: {}", siteEntity.getUrl());
+//            siteEntity.setStatus(SiteStatus.INDEXED.name());
+//            siteEntity.setStatusTime(LocalDateTime.now());
+//            siteEntity.setLastError(null);
+//        }
+//        try {
+//            siteRepository.save(siteEntity);
+//            log.info("Завершение полной индексации и лемматизации сайта: {}", siteEntity.getUrl());
+//        } catch (Exception e) {
+//            String errorMessage = String.format("Ошибка при обновлении статуса сайта %s: %s", siteEntity.getUrl(), e.getMessage());
+//            globalErrorsHandler.addError(errorMessage);
+//            log.error(errorMessage);
+//        }
+//    }
 }
 
